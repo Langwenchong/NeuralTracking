@@ -4,9 +4,9 @@ import os
 # DATA OPTIONS
 #####################################################################################################################
 # dataset_base_dir    = "/cluster/lothlann/data/nonrigid/public/"
-dataset_base_dir    = "/mnt/slurm_cluster/lothlann/data/nonrigid/hidden/"
-workspace           = "."
-experiments_dir     = os.path.join(workspace, "experiments")
+dataset_base_dir    = "/media/shubh/Elements/DeepDeform"
+workspace           = "/media/shubh/Elements/"
+experiments_dir     = os.path.join(workspace, "experiments_paper")
 
 image_width = 640
 image_height = 448
@@ -26,7 +26,7 @@ num_samples_eval = 700
 use_pretrained_model = False # used only in train.py
 
 model_module_to_load = "full_model"    # A: "only_flow_net", B: "full_model"
-model_name           = "model_A"       # your model's name
+model_name           = "model_C"       # your model's name
 model_iteration      = 0               # iteration number of the model you want to load
 
 saved_model = os.path.join(experiments_dir, "models", model_name, f"{model_name}_{model_iteration}.pt")
