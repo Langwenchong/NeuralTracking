@@ -230,8 +230,8 @@ class DeformNet(torch.nn.Module):
         mask_pred = None
         if opt.use_mask:
             mask_pred = self.mask_net(features2, mask_input).view(batch_size, image_height, image_width)
-            mask_pred[:,:,:] = 1.0
-            print(mask_pred)
+            # mask_pred[:,:,:] = 1.0
+            # print(mask_pred)
 
         # Compute mask of valid correspondences
         valid_correspondences = valid_source_points & valid_target_matches
