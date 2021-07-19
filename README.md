@@ -37,6 +37,20 @@ python setup.py build_ext -i
 pip install .
 ```
 
+## Usage 
+Below is the command on how to run on deepdeform dataset
+```
+cd fusion
+python fusion.py <path-to-data> <source-frame> <skip-interval> <key-frame-interval> <voxel-size>
+```
+Arguments:
+-  **path-to-data**: Location of RGBD images. The folder must contain color, depth, mask subfolders. 
+-   **source-frame**: (Default 0th frame) to would be used as source.  
+-   **skip-interval**: (Default 1) increments in for-loop. How many frames to skip
+-   **key-frame-interval**: (Default 50). TSDF gets reinitalized at every 50 frame. Similiar to Fusion4D
+-   **voxel-size**: (Default 0.01). Size of voxel in meters for tsdf volume creation. 
+
+
 ## Data
 
 The raw image data and flow alignments can be obtained at the [DeepDeform](https://github.com/AljazBozic/DeepDeform) repository.
