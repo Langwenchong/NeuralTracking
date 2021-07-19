@@ -3,11 +3,14 @@ import struct
 import numpy as np
 import math
 
+import torch
+
 from NeuralNRT._C import backproject_depth_ushort as backproject_depth_ushort_c
 from NeuralNRT._C import backproject_depth_float as backproject_depth_float_c
 from NeuralNRT._C import warp_flow as warp_flow_c
 from NeuralNRT._C import warp_rigid as warp_rigid_c
 from NeuralNRT._C import warp_3d as warp_3d_c
+
 from utils import utils 
 
 

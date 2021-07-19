@@ -7,9 +7,6 @@ import torch.nn as nn
 import numpy as np
 from timeit import default_timer as timer
 import math
-import torchvision.models as models
-import torchvision.transforms as transforms
-
 from model.correlation import correlation # the custom cost volume layer
 
 backward_grid = {}

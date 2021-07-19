@@ -10,10 +10,8 @@ from utils import image_proc
 from timeit import default_timer as timer
 import random
 import scipy
-import torchvision.transforms.functional as TF
 from utils.utils import load_flow, load_graph_nodes, load_graph_edges, load_graph_edges_weights, load_graph_node_deformations, \
                         load_graph_clusters, load_int_image, load_float_image
-from utils import image_proc
 from NeuralNRT._C import compute_pixel_anchors_geodesic as compute_pixel_anchors_geodesic_c
 from NeuralNRT._C import compute_pixel_anchors_euclidean as compute_pixel_anchors_euclidean_c
 from NeuralNRT._C import compute_mesh_from_depth as compute_mesh_from_depth_c
@@ -21,7 +19,6 @@ from NeuralNRT._C import erode_mesh as erode_mesh_c
 from NeuralNRT._C import sample_nodes as sample_nodes_c
 from NeuralNRT._C import compute_edges_geodesic as compute_edges_geodesic_c
 from NeuralNRT._C import compute_edges_euclidean as compute_edges_euclidean_c
-
 from utils import utils
 
 
@@ -179,6 +176,17 @@ class DeformDataset(Dataset):
             assert max_boundary_dist
             boundary_mask = image_proc.compute_boundary_mask(depth_image, max_boundary_dist)
             return image, boundary_mask, cropper
+
+    @staticmethod
+    def load_mask(mask_path,cropper=None):
+        # Load the mask and crop it
+        if not os.path.isfile(mask_path): return None 
+        
+        mask_image = io.imread(mask_path)
+
+        if cropper is not None:
+            mask_image = cropper(mask_image)
+        return mask_image
 
     @staticmethod
     def load_flow(optical_flow_image_path, scene_flow_image_path, cropper):

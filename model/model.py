@@ -4,17 +4,13 @@ import torch.nn as nn
 import numpy as np
 from timeit import default_timer as timer
 import math
-import torchvision.models as models
-import torchvision.transforms as transforms
 import kornia
 from timeit import default_timer as timer
 from decimal import Decimal
-
 import options as opt
 import utils.query as query
 from utils.nnutils import make_conv_2d, make_upscale_2d, make_downscale_2d, ResBlock2d, Identity
 from model import pwcnet
-
 from NeuralNRT._C import compute_pixel_anchors_geodesic as compute_pixel_anchors_geodesic_c
 from NeuralNRT._C import compute_pixel_anchors_euclidean as compute_pixel_anchors_euclidean_c
 from NeuralNRT._C import compute_mesh_from_depth as compute_mesh_from_depth_c
@@ -92,11 +88,14 @@ class DeformNet(torch.nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.gn_num_iter = 3
+        self.gn_num_iter = 10
         self.gn_data_flow = 0.001
         self.gn_data_depth = 1.0
         self.gn_arap = 1.0
         self.gn_lm_factor = 0.1
+
+        # Optimizer fails for > 3 iterations. Current hack is to stop update is loss increases by 1
+        self.stop_loss_diff = 1
 
         # Optical flow network
         self.flow_net = pwcnet.PWCNet()
@@ -125,12 +124,15 @@ class DeformNet(torch.nn.Module):
         ], dtype=np.float32)
         self.vec_to_skew_mat = torch.from_numpy(vec_to_skew_mat_np).to('cuda')
 
+
+
     def forward(
         self, x1, x2, 
         graph_nodes, graph_edges, graph_edges_weights, graph_clusters,
         pixel_anchors, pixel_weights, 
         num_nodes_vec, intrinsics, 
-        evaluate=False, split="train"
+        evaluate=False, split="train", 
+        prev_rot=None,prev_trans=None
     ):
         batch_size = x1.shape[0]
 
@@ -228,6 +230,8 @@ class DeformNet(torch.nn.Module):
         mask_pred = None
         if opt.use_mask:
             mask_pred = self.mask_net(features2, mask_input).view(batch_size, image_height, image_width)
+            mask_pred[:,:,:] = 1.0
+            print(mask_pred)
 
         # Compute mask of valid correspondences
         valid_correspondences = valid_source_points & valid_target_matches
@@ -281,12 +285,16 @@ class DeformNet(torch.nn.Module):
                 "deformed_points_pred": deformed_points_pred, 
                 "valid_solve": valid_solve, 
                 "mask_pred": mask_pred,
-                "correspondence_info": [
-                    xy_coords_warped, 
-                    source_points, valid_source_points, 
-                    target_matches, valid_target_matches,
-                    None, deformed_points_idxs, deformed_points_subsampled
-                ], 
+                "correspondence_info": {
+                    "xy_coords_warped":xy_coords_warped, 
+                    "source_points":source_points,
+                    "valid_source_points":valid_source_points, 
+                    "target_matches":target_matches,
+                    "valid_target_matches":valid_target_matches,
+                    "valid_correspondences":None, 
+                    "deformed_points_idxs":deformed_points_idxs, 
+                    "deformed_points_subsampled": deformed_points_subsampled
+                }, 
                 "convergence_info": convergence_info,
                 "weight_info": {
                     "total_corres_num": 0,
@@ -315,8 +323,8 @@ class DeformNet(torch.nn.Module):
 
             num_nodes_i = num_nodes_vec[i]
             if num_nodes_i > opt.gn_max_nodes or num_nodes_i < opt.gn_min_nodes: 
-                print("\tSolver failed: Invalid number of nodes: {0}".format(num_nodes_i))
-                convergence_info[i]["errors"].append("Solver failed: Invalid number of nodes: {0}".format(num_nodes_i))
+                print(f"\tSolver failed: Invalid number of nodes: {num_nodes_i}. Allowed Range=> {opt.gn_min_nodes}:{opt.gn_max_nodes}. Change node coverage parameter during graph creation.")
+                convergence_info[i]["errors"].append(f"Solver failed: Invalid number of nodes: {num_nodes_i}. Allowed Range=> {opt.gn_min_nodes}:{opt.gn_max_nodes}. Change node coverage parameter during graph creation.")
                 continue
 
             if not correspondences_exist[i]: 
@@ -482,8 +490,8 @@ class DeformNet(torch.nn.Module):
 
             if opt_num_nodes_i > opt.gn_max_nodes or opt_num_nodes_i < opt.gn_min_nodes:
                 if opt.gn_debug:
-                    print("\tSolver failed: Invalid number of nodes: {0}".format(opt_num_nodes_i))
-                convergence_info[i]["errors"].append("Solver failed: Invalid number of nodes: {0}".format(opt_num_nodes_i))
+                    print(f"\tSolver failed: Invalid number of nodes: {num_nodes_i}. Allowed Range=> {opt.gn_min_nodes}:{opt.gn_max_nodes}. Change node coverage parameter during graph creation.")
+                convergence_info[i]["errors"].append(f"Solver failed: Invalid number of nodes: {num_nodes_i}. Allowed Range=> {opt.gn_min_nodes}:{opt.gn_max_nodes}. Change node coverage parameter during graph creation.")
                 continue
 
             # Since source anchor ids need to be long in order to be used as indices,
@@ -517,8 +525,13 @@ class DeformNet(torch.nn.Module):
             # translation for every node. All node rotation parameters are listed first, and
             # then all node translation parameters are listed.
             #                        x = [w_current_all, t_current_all]
-            R_current = torch.eye(3, dtype=x1.dtype, device=x1.device).view(1, 3, 3).repeat(opt_num_nodes_i, 1, 1)
-            t_current = torch.zeros((opt_num_nodes_i, 3, 1), dtype=x1.dtype, device=x1.device) 
+
+            if prev_rot is None and prev_trans is None:
+                R_current = torch.eye(3, dtype=x1.dtype, device=x1.device).view(1, 3, 3).repeat(opt_num_nodes_i, 1, 1)
+                t_current = torch.zeros((opt_num_nodes_i, 3, 1), dtype=x1.dtype, device=x1.device) 
+            else:
+                R_current = torch.tensor(prev_rot[map_opt_nodes_to_complete_nodes_i, :, :],dtype=x1.dtype,device=x1.device).view(opt_num_nodes_i, 3, 3)
+                t_current = torch.tensor(prev_trans[map_opt_nodes_to_complete_nodes_i, :],dtype=x1.dtype,device=x1.device).view(opt_num_nodes_i, 3, 1)
 
             if opt.gn_debug:
                 print("\tNum. matches: {0} || Num. nodes: {1} || Num. edges: {2}".format(num_matches, opt_num_nodes_i, num_edges_i))
@@ -537,6 +550,10 @@ class DeformNet(torch.nn.Module):
             ill_posed_system = False
 
             for gn_i in range(num_gn_iter):
+
+                if gn_i % 3 == 2:
+                    lm_factor /= 2;
+
                 timer_data_start = timer()
 
                 ##########################################
@@ -742,6 +759,17 @@ class DeformNet(torch.nn.Module):
             
                 if opt.gn_print_timings: print("\t\tLinear solve: {:.3f} s".format(timer() - timer_solve_start))
                     
+                loss_data = torch.norm(res_data).item()
+                loss_total = torch.norm(res).item()
+
+                if len(convergence_info[i]["total"]): 
+                    if loss_total - convergence_info[i]["total"][-1] > self.stop_loss_diff:
+                        print("As loss is greater than before breaking optimization")
+                        break
+
+                convergence_info[i]["data"].append(loss_data)
+                convergence_info[i]["total"].append(loss_total)
+
                 # Increment the current rotation and translation.
                 R_inc = kornia.angle_axis_to_rotation_matrix(x[:opt_num_nodes_i*3].view(opt_num_nodes_i, 3))
                 t_inc = x[opt_num_nodes_i*3:].view(opt_num_nodes_i, 3, 1)
@@ -749,11 +777,6 @@ class DeformNet(torch.nn.Module):
                 R_current = torch.matmul(R_inc, R_current)
                 t_current = t_current + t_inc
 
-                loss_data = torch.norm(res_data).item()
-                loss_total = torch.norm(res).item()
-
-                convergence_info[i]["data"].append(loss_data)
-                convergence_info[i]["total"].append(loss_total)
 
                 if num_edges_i > 0:
                     loss_arap = torch.norm(res_arap).item()
@@ -761,7 +784,7 @@ class DeformNet(torch.nn.Module):
 
                 if opt.gn_debug:
                     if num_edges_i > 0:
-                        print("\t\t-->Iteration: {0}. Loss: \tdata = {1:.3f}, \tarap = {2:.3f}, \ttotal = {3:.3f}".format(gn_i, loss_data, loss_arap, loss_total))
+                        print("\t\t-->Iteration: {0}. Lm:{1:.3f} Loss: \tdata = {2:.3f}, \tarap = {3:.3f}, \ttotal = {4:.3f}".format(gn_i, lm_factor,loss_data, loss_arap, loss_total))
                     else:
                         print("\t\t-->Iteration: {0}. Loss: \tdata = {1:.3f}, \ttotal = {2:.3f}".format(gn_i, loss_data, loss_total))
 
@@ -851,12 +874,16 @@ class DeformNet(torch.nn.Module):
             "deformed_points_pred": deformed_points_pred, 
             "valid_solve": valid_solve, 
             "mask_pred": mask_pred,
-            "correspondence_info": [
-                xy_coords_warped, 
-                source_points, valid_source_points, 
-                target_matches, valid_target_matches,
-                valid_correspondences, deformed_points_idxs, deformed_points_subsampled
-            ], 
+            "correspondence_info": {
+                "xy_coords_warped":xy_coords_warped, 
+                "source_points":source_points, 
+                "valid_source_points":valid_source_points, 
+                "target_matches":target_matches, 
+                "valid_target_matches":valid_target_matches,
+                "valid_correspondences":valid_correspondences, 
+                "deformed_points_idxs":deformed_points_idxs,
+                "deformed_points_subsampled":deformed_points_subsampled
+            }, 
             "convergence_info": convergence_info,
             "weight_info": weight_info
         }

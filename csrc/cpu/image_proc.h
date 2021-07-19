@@ -54,7 +54,7 @@ namespace image_proc {
 
     void compute_mesh_from_depth(
         const py::array_t<float>& pointImage, float maxTriangleEdgeDistance, 
-        py::array_t<float>& vertexPositions, py::array_t<int>& faceIndices
+        py::array_t<float>& vertexPositions, py::array_t<int>& vertexPixels, py::array_t<int>& faceIndices
     );
 
     void compute_mesh_from_depth_and_color(

@@ -26,7 +26,7 @@ num_samples_eval = 700
 use_pretrained_model = False # used only in train.py
 
 model_module_to_load = "full_model"    # A: "only_flow_net", B: "full_model"
-model_name           = "model_C"       # your model's name
+model_name           = "model_A"       # your model's name
 model_iteration      = 0               # iteration number of the model you want to load
 
 saved_model = os.path.join(experiments_dir, "models", model_name, f"{model_name}_{model_iteration}.pt")
@@ -34,7 +34,7 @@ saved_model = os.path.join(experiments_dir, "models", model_name, f"{model_name}
 #####################################################################################################################
 # TRAINING OPTIONS
 #####################################################################################################################
-mode = "0_flow" # ["0_flow", "1_solver", "2_mask", "3_refine"]
+mode = "4_your_custom_settings" # ["0_flow", "1_solver", "2_mask", "3_refine"]
 
 if mode == "0_flow":
     from settings.settings_flow import *
@@ -45,8 +45,7 @@ elif mode == "2_mask":
 elif mode == "3_refine":
     from settings.settings_refine import *
 elif mode == "4_your_custom_settings":
-    # from settings.4_your_custom_settings import *
-    pass
+    from settings.custom_settings import *
 
 #####################################################################################################################
 # Print options

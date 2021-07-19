@@ -403,7 +403,7 @@ namespace image_proc {
 
     void compute_mesh_from_depth(
         const py::array_t<float>& pointImage, float maxTriangleEdgeDistance, 
-        py::array_t<float>& vertexPositions, py::array_t<int>& faceIndices
+        py::array_t<float>& vertexPositions, py::array_t<int>& vertexPixels, py::array_t<int>& faceIndices
     ) {
         int width = pointImage.shape(2);
         int height = pointImage.shape(1);
@@ -418,6 +418,7 @@ namespace image_proc {
         // point towards the camera.
         std::vector<Eigen::Vector3f> vertices;
         std::vector<Eigen::Vector3i> faces;
+        std::vector<Eigen::Vector2i> pixels;
 
         int vertexIdx = 0;
         std::vector<int> mapPixelToVertexIdx(width * height, -1);
@@ -453,18 +454,23 @@ namespace image_proc {
                             vIdx0 = vertexIdx;
                             mapPixelToVertexIdx[idx00] = vertexIdx;
                             vertices.push_back(obs00);
+                            pixels.push_back(Eigen::Vector2i(x, y));
+
                             vertexIdx++;
                         }
                         if (vIdx1 == -1) {
                             vIdx1 = vertexIdx;
                             mapPixelToVertexIdx[idx01] = vertexIdx;
                             vertices.push_back(obs01);
+                            pixels.push_back(Eigen::Vector2i(x, y+1));
+
                             vertexIdx++;
                         }
                         if (vIdx2 == -1) {
                             vIdx2 = vertexIdx;
                             mapPixelToVertexIdx[idx10] = vertexIdx;
                             vertices.push_back(obs10);
+                            pixels.push_back(Eigen::Vector2i(x+1, y));
                             vertexIdx++;
                         }
 
@@ -486,18 +492,22 @@ namespace image_proc {
                             vIdx0 = vertexIdx;
                             mapPixelToVertexIdx[idx11] = vertexIdx;
                             vertices.push_back(obs11);
+                            pixels.push_back(Eigen::Vector2i(x+1, y + 1));
+
                             vertexIdx++;
                         }
                         if (vIdx1 == -1) {
                             vIdx1 = vertexIdx;
                             mapPixelToVertexIdx[idx10] = vertexIdx;
                             vertices.push_back(obs10);
+                            pixels.push_back(Eigen::Vector2i(x+1, y));
                             vertexIdx++;
                         }
                         if (vIdx2 == -1) {
                             vIdx2 = vertexIdx;
                             mapPixelToVertexIdx[idx01] = vertexIdx;
                             vertices.push_back(obs01);
+                            pixels.push_back(Eigen::Vector2i(x, y+1));
                             vertexIdx++;
                         }
 
@@ -515,12 +525,16 @@ namespace image_proc {
             // Reference check should be set to false otherwise there is a runtime
             // error. Check why that is the case.
             vertexPositions.resize({ nVertices, 3 }, false);
+            vertexPixels.resize({ nVertices, 2 }, false);
             faceIndices.resize({ nFaces, 3 }, false);
 
             for (int i = 0; i < nVertices; i++) {
                 *vertexPositions.mutable_data(i, 0) = vertices[i].x();
                 *vertexPositions.mutable_data(i, 1) = vertices[i].y();
                 *vertexPositions.mutable_data(i, 2) = vertices[i].z();
+
+                *vertexPixels.mutable_data(i, 0) = pixels[i].x();
+                *vertexPixels.mutable_data(i, 1) = pixels[i].y();
             }
             
             for (int i = 0; i < nFaces; i++) {

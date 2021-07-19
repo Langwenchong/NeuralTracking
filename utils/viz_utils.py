@@ -4,6 +4,113 @@ import copy
 import open3d as o3d
 import numpy as np
 
+import utils.line_mesh as line_mesh_utils
+
+def get_pcd(rgbd_image):
+    #####################################################################################################
+    # Prepare data
+    # @pramas: rgbd_image => 6xHxW np.array (containing the rgb and point image)
+    #####################################################################################################
+    
+    rgbd_flat = np.moveaxis(rgbd_image, 0, -1).reshape(-1, 6)
+    rgbd_points = transform_pointcloud_to_opengl_coords(rgbd_flat[..., 3:])
+    # rgbd_points = rgbd_flat[..., 3:]
+    rgbd_colors = rgbd_flat[..., :3]
+
+    rgbd_pcd = o3d.geometry.PointCloud()
+    rgbd_pcd.points = o3d.utility.Vector3dVector(rgbd_points)
+    rgbd_pcd.colors = o3d.utility.Vector3dVector(rgbd_colors)
+    return rgbd_pcd
+
+
+def create_open3d_graph(graph_nodes,graph_edges,color=[1.0,0.0,0.0]):
+    # Transform to OpenGL coords
+    # graph_nodes = transform_pointcloud_to_opengl_coords(graph_nodes)
+
+    size = max(1,np.linalg.norm(np.max(graph_nodes)-np.min(graph_nodes)))
+    # print(size)
+    # Graph nodes
+    rendered_graph_nodes = []
+    for node in graph_nodes:
+        mesh_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.004*size)
+        mesh_sphere.compute_vertex_normals()
+        mesh_sphere.paint_uniform_color(color)
+        mesh_sphere.translate(node)
+        rendered_graph_nodes.append(mesh_sphere)
+    
+    # Merge all different sphere meshes
+    rendered_graph_nodes = merge_meshes(rendered_graph_nodes)
+
+    # Graph edges
+    if len(graph_edges) == 1: 
+        line_mesh_geoms = o3d.geometry.TriangleMesh()  
+    else:
+        edges_pairs = []
+        for node_id, edges in enumerate(graph_edges):
+            for neighbor_id in edges:
+                if neighbor_id == -1:
+                    break
+                edges_pairs.append([node_id, neighbor_id])    
+
+        colors = [[0.2, 1.0, 0.2] for i in range(len(edges_pairs))]
+        line_mesh = line_mesh_utils.LineMesh(graph_nodes, edges_pairs, colors, radius=0.0006*size)
+        line_mesh_geoms = line_mesh.cylinder_segments
+        # Merge all different line meshes
+        line_mesh_geoms = merge_meshes(line_mesh_geoms)
+
+
+    # Combined nodes & edges
+    rendered_graph = [rendered_graph_nodes, line_mesh_geoms]
+    return rendered_graph
+
+def create_matches_lines(match_mask,high_color,low_color,source_pcd,target_matches,mask_pred_flat,weight_thr,weight_scale):
+
+    match_source_points_corresp  = np.asarray(source_pcd.points)[match_mask]
+    match_target_matches_corresp = target_matches[match_mask]
+    match_mask_pred              = mask_pred_flat[match_mask]
+    # number of match matches
+    n_match_matches = match_source_points_corresp.shape[0]
+    
+    # Subsample if too many lines
+    N = 2000
+    subsample = N < n_match_matches
+    if subsample:
+        sampled_idxs = np.random.permutation(n_match_matches)[:N]
+        match_source_points_corresp  = match_source_points_corresp[sampled_idxs]
+        match_target_matches_corresp = match_target_matches_corresp[sampled_idxs]
+        match_mask_pred              = match_mask_pred[sampled_idxs]
+        n_match_matches = N
+    # both match_source and match_target points together into one vector
+    match_matches_points = np.concatenate([match_source_points_corresp, match_target_matches_corresp], axis=0)
+    match_matches_lines = [[i, i + n_match_matches] for i in range(0, n_match_matches, 1)]
+
+    # --> Create match (unweighted) lines 
+    match_matches_colors = [[201/255, 177/255, 14/255] for i in range(len(match_matches_lines))]
+    match_matches_set = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(match_matches_points),
+        lines=o3d.utility.Vector2iVector(match_matches_lines),
+    )
+    match_matches_set.colors = o3d.utility.Vector3dVector(match_matches_colors)
+
+    # --> Create match weighted lines 
+    match_weighted_matches_colors = np.ones_like(match_source_points_corresp)
+
+    weights_normalized = np.maximum(np.minimum(0.5 + (match_mask_pred - weight_thr) / weight_scale, 1.0), 0.0)
+    weights_normalized_opposite = 1 - weights_normalized
+
+    match_weighted_matches_colors[:, 0] = weights_normalized * high_color[0] + weights_normalized_opposite * low_color[0]
+    match_weighted_matches_colors[:, 1] = weights_normalized * high_color[1] + weights_normalized_opposite * low_color[1]
+    match_weighted_matches_colors[:, 2] = weights_normalized * high_color[2] + weights_normalized_opposite * low_color[2]
+
+    match_weighted_matches_set = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(match_matches_points),
+        lines=o3d.utility.Vector2iVector(match_matches_lines),
+    )
+    match_weighted_matches_set.colors = o3d.utility.Vector3dVector(match_weighted_matches_colors)
+
+    return match_matches_set,match_weighted_matches_set
+
+
 
 def transform_pointcloud_to_opengl_coords(points_cv):
     assert len(points_cv.shape) == 2 and points_cv.shape[1] == 3
