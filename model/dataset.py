@@ -143,12 +143,17 @@ class DeformDataset(Dataset):
     def load_image(
         color_image_path, depth_image_path, 
         intrinsics, input_height, input_width, cropper=None,
-        max_boundary_dist=0.1, compute_boundary_mask=False
-    ):
+        max_boundary_dist=0.1, compute_boundary_mask=False):
         # Load images.
         color_image = io.imread(color_image_path) # (h, w, 3)
         depth_image = io.imread(depth_image_path) # (h, w)
 
+        return DeformDataset.create_image(color_image, depth_image, intrinsics, input_height, input_width, cropper=cropper, max_boundary_dist=max_boundary_dist, compute_boundary_mask=compute_boundary_mask)
+
+    @staticmethod    
+    def create_image(color_image, depth_image, 
+        intrinsics, input_height, input_width, cropper=None,
+        max_boundary_dist=0.1, compute_boundary_mask=False): 
         # Backproject depth image.
         depth_image = image_proc.backproject_depth(depth_image, intrinsics["fx"], intrinsics["fy"], intrinsics["cx"], intrinsics["cy"]) # (3, h, w)
         depth_image = depth_image.astype(np.float32)
@@ -182,7 +187,7 @@ class DeformDataset(Dataset):
         # Load the mask and crop it
         if not os.path.isfile(mask_path): return None 
         
-        mask_image = io.imread(mask_path)
+        mask_image = io.imread(mask_path)//255 # convert to binary 0-1 format
 
         if cropper is not None:
             mask_image = cropper(mask_image)
