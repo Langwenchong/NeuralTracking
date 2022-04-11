@@ -1,11 +1,12 @@
 import os
-
+import pwd
 #####################################################################################################################
 # DATA OPTIONS
 #####################################################################################################################
 # dataset_base_dir    = "/cluster/lothlann/data/nonrigid/public/"
-dataset_base_dir    = "/media/shubh/Elements/DeepDeform"
-workspace           = "/media/shubh/Elements/"
+user = pwd.getpwuid(os.getuid())[0]
+dataset_base_dir    = f"/media/{user}/Elements/AT-Datasets/DeepDeform/"
+workspace           = f"/media/{user}/Elements/"
 experiments_dir     = os.path.join(workspace, "experiments_paper")
 
 image_width = 640

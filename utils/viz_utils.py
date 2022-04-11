@@ -6,10 +6,11 @@ import numpy as np
 
 import utils.line_mesh as line_mesh_utils
 
-def get_pcd(rgbd_image):
+def get_pcd(rgbd_image,max_points=1000000):
     #####################################################################################################
     # Prepare data
     # @pramas: rgbd_image => 6xHxW np.array (containing the rgb and point image)
+    #          max_points => int (maximum number of points allowed)
     #####################################################################################################
     
     rgbd_flat = np.moveaxis(rgbd_image, 0, -1).reshape(-1, 6)
@@ -17,24 +18,38 @@ def get_pcd(rgbd_image):
     # rgbd_points = rgbd_flat[..., 3:]
     rgbd_colors = rgbd_flat[..., :3]
 
+    if len(rgbd_points) > max_points: # Downsample 
+        print(f"Exceeded number of points:{len(rgbd_points)} reducing to:{max_points}")
+        show_indices = np.random.choice(len(rgbd_points),size=max_points,replace=False)
+        rgbd_points = rgbd_points[show_indices]
+        rgbd_colors = rgbd_colors[show_indices]
+
     rgbd_pcd = o3d.geometry.PointCloud()
     rgbd_pcd.points = o3d.utility.Vector3dVector(rgbd_points)
     rgbd_pcd.colors = o3d.utility.Vector3dVector(rgbd_colors)
     return rgbd_pcd
 
 
-def create_open3d_graph(graph_nodes,graph_edges,color=[1.0,0.0,0.0]):
+def create_open3d_graph(graph_nodes,graph_edges,color=None):
     # Transform to OpenGL coords
     # graph_nodes = transform_pointcloud_to_opengl_coords(graph_nodes)
 
     size = max(1,np.linalg.norm(np.max(graph_nodes)-np.min(graph_nodes)))
-    # print(size)
+
     # Graph nodes
     rendered_graph_nodes = []
-    for node in graph_nodes:
+    for i,node in enumerate(graph_nodes):
         mesh_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.004*size)
         mesh_sphere.compute_vertex_normals()
-        mesh_sphere.paint_uniform_color(color)
+
+
+        # Color Nodes  
+        if color is None: 
+            ncolor = [1.0,0.0,0.0]
+        else: 
+            ncolor = color[i]
+        mesh_sphere.paint_uniform_color(ncolor)
+
         mesh_sphere.translate(node)
         rendered_graph_nodes.append(mesh_sphere)
     
@@ -131,13 +146,13 @@ class CustomDrawGeometryWithKeyCallback():
     def __init__(self, geometry_dict, alignment_dict, corresp_set):
         self.added_source_pcd = True
         self.added_source_obj = False
-        self.added_target_pcd = False
-        self.added_graph = False
+        self.added_target_pcd = True
+        self.added_graph = True
 
         self.added_both = False
 
         self.added_corresp = False
-        self.added_weighted_corresp = False
+        self.added_weighted_corresp = True
 
         self.aligned = False
 
@@ -254,17 +269,24 @@ class CustomDrawGeometryWithKeyCallback():
             return False
 
         def view_source(vis):
-            print("::view_source")
 
             self.clear_for(vis, "source")
             
             param = vis.get_view_control().convert_to_pinhole_camera_parameters()
 
             if not self.added_source_pcd:
+                print("::Added Source")
                 vis.add_geometry(self.source_pcd)
                 self.added_source_pcd = True
 
+            if self.added_source_pcd:
+                print("::Removed Source")
+                vis.remove_geometry(self.source_pcd)
+                self.added_source_pcd = False
+
+
             if self.added_source_obj:
+
                 vis.remove_geometry(self.source_obj)
                 self.added_source_obj = False
 
@@ -282,9 +304,14 @@ class CustomDrawGeometryWithKeyCallback():
             
             param = vis.get_view_control().convert_to_pinhole_camera_parameters()
 
+            if self.added_target_pcd:
+                vis.remove_geometry(self.target_pcd)
+                self.added_target_pcd = False
+
             if not self.added_target_pcd:
                 vis.add_geometry(self.target_pcd)
                 self.added_target_pcd = True
+
 
             self.remove_both_pcd_and_object(vis, "source")
             
@@ -564,7 +591,12 @@ class CustomDrawGeometryWithKeyCallback():
         key_to_callback[ord("A")] = align
         key_to_callback[ord("Z")] = reload_source_object
 
-        o3d.visualization.draw_geometries_with_key_callbacks([self.source_pcd], key_to_callback)
+        # vis = o3d.visualization.VisualizerWithKeyCallback()
+        # vis.create_window()
+
+
+
+        o3d.visualization.draw_geometries_with_key_callbacks([self.source_pcd,self.target_pcd,self.good_weighted_matches_set,self.bad_weighted_matches_set] + [g for g in self.graph], key_to_callback)
 
 
 def merge_meshes(meshes):

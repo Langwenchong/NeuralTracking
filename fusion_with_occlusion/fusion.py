@@ -6,32 +6,37 @@ import argparse # To parse arguments
 import logging # To log info 
 
 
-
-
 sys.path.append("../")  # Making it easier to load modules
-
 # Neural Tracking Modules
-from utils import image_proc
-import utils.viz_utils as viz_utils
-import utils.line_mesh as line_mesh_utils
+# from utils import image_proc
+# import utils.viz_utils as viz_utils
+# import utils.line_mesh as line_mesh_utils
+
 
 # Fusion Modules 
 from frame_loader import RGBDVideoLoader
 from tsdf import TSDFVolume # Create main TSDF module where the 3D volume is stored
 from embedded_deformation_graph import EDGraph # Create ED graph from mesh, depth image, tsdf 
-from log import get_visualizer # Visualizer 
+from vis import get_visualizer # Visualizer 
 from run_model import Deformnet_runner # Neural Tracking Moudle 
 from warpfield import WarpField # Connects ED Graph and TSDF/Mesh/Whatever needs to be deformed  
 
 
+
+
 class DynamicFusion:
 	def __init__(self,opt):
-		self.vis = get_visualizer(opt) # Visualizer / Logger
 		self.frameloader = RGBDVideoLoader(opt.datadir)
 		self.opt = opt 
 		
 		self.model = Deformnet_runner()	
-	
+		
+		# For logging results
+		self.log = logging.getLogger(__name__)
+
+		# Define visualizer
+		self.vis = get_visualizer(opt)
+
 	def create_tsdf(self):
 		# Need to load initial frame 
 		self.target_frame = self.opt.source_frame
@@ -41,16 +46,16 @@ class DynamicFusion:
 		max_depth = source_data["im"][-1].max()
 
 		# Create a new tsdf volume
-		self.tsdf = TSDFVolume(max_depth+1, source_data["intrinsics"], self.opt)
+		self.tsdf = TSDFVolume(max_depth+1, source_data["intrinsics"], self.opt,self.vis)
 
 		# Add TSDF to visualizer
 		self.vis.tsdf = self.tsdf
-
-
 		# Integrate source frame 
 		assert "mask" in source_data, "Source frame must contain segmented object for graph generation"
 		mask = source_data["mask"]
+
 		source_data["im"][:, mask == 0] = 0
+		
 		self.tsdf.integrate(source_data)
 
 
@@ -59,15 +64,23 @@ class DynamicFusion:
 		assert hasattr(self,'tsdf'), "TSDF not defined. Run create_tsdf first." 
 	
 		# Initialize graph 
-		self.graph = EDGraph(self.tsdf)
-		self.tsdf.graph = self.graph 		# Add graph to tsdf
+		self.graph = EDGraph(self.tsdf,self.vis)
+
+		self.tsdf.graph = self.graph 		# Add graph to tsdf		
+		self.model.graph = self.graph 		# Add graph to Model 
 		self.vis.graph  = self.graph 		# Add graph to visualizer 
 
 		assert hasattr(self,'graph'),  "Graph not defined. Run create_graph first." 
-		self.warpfield = WarpField(self.graph,self.tsdf)
-		self.tsdf.warpfield = self.warpfield
+
+		self.warpfield = WarpField(self.graph,self.tsdf,self.vis)
 
 
+		self.tsdf.warpfield = self.warpfield  # Add warpfield to tsdf
+		self.model.warpfield = self.warpfield # Add warpfield to Model
+		self.vis.warpfield = self.warpfield   # Add warpfield to visualizer
+
+
+		self.warpfield.model = self.model
 
 	def register_new_frame(self): 
 
@@ -75,12 +88,14 @@ class DynamicFusion:
 		if self.target_frame + self.opt.skip_rate > len(self.frameloader):
 			return False,"Registration Completed"
 
-		success = self.register_frame(self.target_frame,self.target_frame + self.opt.skip_rate)
+		self.log.info(f"Registering {self.target_frame}th frame to {self.target_frame + self.opt.skip_rate}th frame")
+
+		success,msg = self.register_frame(self.target_frame,self.target_frame + self.opt.skip_rate)
 		
 		# Update frame number 
 		self.target_frame = self.target_frame + self.opt.skip_rate
 
-		return success
+		return success,msg
 
 	def register_frame(self,source_frame,target_frame):
 		"""
@@ -101,11 +116,12 @@ class DynamicFusion:
 		skin_data		   = self.warpfield.skin_image(reduced_graph_dict["graph_nodes"],source_frame_data)
 
 		# Compute optical flow and estimate transformation for graph using neural tracking
-
 		estimated_reduced_graph_parameters = self.model(source_frame_data,\
 			target_frame_data,reduced_graph_dict,skin_data)
 
-		# good_match,bad_match = self.vis.plot_frame(source_data, target_data, graph_data, estimated_reduced_graph_parameters)
+		# self.vis.plot_alignment(source_frame_data,\
+		# 	target_frame_data,reduced_graph_dict,skin_data,\
+		# 	estimated_reduced_graph_parameters)
 
 		# USE ARAP to extend to complete graph 
 		# TODO add tests to visualize registerd transformations 
@@ -114,40 +130,23 @@ class DynamicFusion:
 			estimated_reduced_graph_parameters,
 			self.graph,self.warpfield)
 
-		# Update parameters 
+		# Update warpfield parameters, warpfield maps to target frame  
 		self.warpfield.update_transformations(estimated_complete_graph_parameters)
 
-		# Register TSDF 
-		self.warpfield.deform_tsdf() # Deform world pts to target frame space and then register
+		# Register TSDF, tsdf maps to target frame  
 		self.tsdf.integrate(target_frame_data)
 
 		# Add new nodes to warpfield and graph if any
 		update = self.warpfield.update_graph() 
-		if update: 
-			##################################    
-			# Update deformation parameters  #
-			##################################
 
-			graph_data = self.graph.get_reduced_graph(np.ones(self.graph.shape[0],dtype=np.bool)) # Get all nodes 
-			transformation_data = self.warpfield.get_transformation_wrt_graph_node() # Get their transformations     
-			for k in graph_data:
-				try: 
-					print(k,graph_data[k].shape)
-				except: 
-					continue 
-
-				
-			estimated_new_graph_parameters = self.run_arap(graph_data,transformation_data,self.graph,self.warpfield)
-
-			# TODO: Needs refactoring  
-			self.warpfield.update_transformations(estimated_complete_graph_parameters)
-
+		self.vis.show(debug=source_frame > 100) # plot registration details 
 
 		# Return whether sucess or failed in registering 
-		return True
+		return True, f"Registered {source_frame}th frame to {target_frame}th frame. Added graph nodes:{update}"
 
 	def clear_frame_data(self):
 		if hasattr(self,'tsdf'):  self.tsdf.clear() # Clear image information, remove deformed model 
+		if hasattr(self,'warpfield'):  self.warpfield.clear() # Clear image information, remove deformed model 
 		# if hasattr(self,'graph'): self.graph.clear()   # Remove estimated deformation from previous timesteps 	
 
 	def __call__(self):
@@ -156,18 +155,21 @@ class DynamicFusion:
 		self.create_tsdf()
 		self.create_graph()
 
-		self.vis.init_plot()
+		# self.vis.init_plot()
 
 		# Run fusion 
 		while True: 
 
 			success, msg = self.register_new_frame()
-			self.vis.show() # Print data and plot registration details 
-			if ~success: 
-				break
+			self.log.info(msg) # Print data
+
+			# if ~success: 
+			# 	break
 			self.clear_frame_data() # Reset information 
 
 		self.vis.create_video("./results.mp4")
+
+
 
 if __name__ == "__main__":
 	args = argparse.ArgumentParser() 
@@ -188,13 +190,17 @@ if __name__ == "__main__":
 
 
 	# Arguments for debugging  
-	args.add_argument('--debugging_level', default=2, type=int, help='Logging Information. 0: No logging, 1: Only print, 2: Logging + Visualization')
+	args.add_argument('--debug', default=True, type=bool, help='Whether debbugging or not. True: Logging + Visualization, False: Only Critical information and plots')
 	args.add_argument('--visualizer', default='open3d', type=str, help='if debugging_level == 2, also plot registration')
 
 	opt = args.parse_args()
 
 	# Logging details 
-	logging.basicConfig(stream=sys.stdout, level=logging.INFO) 
+	logging.basicConfig(stream=sys.stdout, level=logging.INFO if opt.debug is False else logging.DEBUG) 
+	logging.getLogger('numba').setLevel(logging.WARNING)
+	logging.getLogger('PIL').setLevel(logging.WARNING)
+
+
 
 	dfusion = DynamicFusion(opt)
 	dfusion()

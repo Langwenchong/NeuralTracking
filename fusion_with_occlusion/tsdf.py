@@ -25,7 +25,6 @@ except Exception as err:
 
 # CPU module imports
 from pykdtree.kdtree import KDTree as KDTreeCPU
-from dq3d import quat
 
 # Modules
 sys.path.append("../")
@@ -40,7 +39,7 @@ class TSDFVolume:
     """
         Volumetric TSDF Fusion of RGB-D Images.
     """
-    def __init__(self, max_depth, cam_intr,fopt):   
+    def __init__(self, max_depth, cam_intr,fopt,visualizer):   
         """
         Args:
             max_depth (float): Maximum depth in the sequence 
@@ -59,6 +58,7 @@ class TSDFVolume:
 
         # Save fusion hyperparameters for future use
         self.fopt = fopt
+        self.vis  = visualizer
 
         # Get corners of 3D camera view frustum of depth image
         im_h = opt.image_height
@@ -105,9 +105,11 @@ class TSDFVolume:
         # Copy voxel volumes to GPU
         if self.gpu_mode:
 
+
             # Determine block/grid size on GPU
             gpu_dev = pycuda_ctx.get_device()
             pycuda_ctx.push()
+
             self._max_gpu_threads_per_block = gpu_dev.MAX_THREADS_PER_BLOCK
             n_blocks = int(np.ceil(float(np.prod(self._vol_dim))/float(self._max_gpu_threads_per_block)))
             grid_dim_x = min(gpu_dev.MAX_GRID_DIM_X, int(np.floor(np.cbrt(n_blocks))))
@@ -326,7 +328,7 @@ class TSDFVolume:
 
 
         # Update image information in TSDF class, need to be stored for future applications  
-        self.update(image_data["im"],image_data["id"]) 
+        self.update(image_data["im"],image_data["id"]) # Now tsdf maps to the target frame 
 
         cam_pose = np.eye(4)  # TODO For future if we want to integrate varying camera pose too
 
@@ -336,19 +338,15 @@ class TSDFVolume:
             cam_pts = self.world_pts
             valid_points = np.ones(self._vol_dim,dtype=np.bool).reshape(-1)
 
-        elif not hasattr(self,' is_deformed'):  # Assert the TSDF is already deformed using the current
-            world_pts = self.warpfield.deform()
-        # if graph_deformation_data is None:
-            # For frames where no deformation is be calculated like source frame at first timestep
-            cam_pts = self.warpfield.world_pts
-            valid_points = np.ones(self._vol_dim,dtype=np.bool).reshape(-1)
         else:
-            cam_pts,valid_points = self.warpfield.deform_tsdf(graph_deformation_data["node_rotations"],
-                                                 graph_deformation_data["node_translations"])   
+            cam_pts,valid_points = self.warpfield.deform_tsdf()   
+        
+        # Begin integration 
         im_h, im_w = self.depth_im.shape
         if self.gpu_mode:  # GPU mode: integrate voxel volume (calls CUDA kernel)
 
             cam_pts = cam_pts.reshape(-1,3)
+            valid_points 
             pycuda_ctx.push()
             for gpu_loop_idx in range(self._n_gpu_loops):
                 self._cuda_integrate(
@@ -450,32 +448,33 @@ class TSDFVolume:
             im (nd.array): An RGB+PointImage (6,H, W).
         """
 
-        # Update image_data     
+        # Update image_data    
         color_im = np.moveaxis(im[:3], 0, -1)
         depth_im = im[-1]
 
         assert len(color_im.shape) == 3 and len(depth_im.shape) == 2,\
             "Input not correct\nDepth:{depth_im.shape} should be (H,W)\nColor:{color_im.shape} should be (H,W,3)"
 
-
+        # self.vis.imshow(color_im)
         # Fold RGB color image into a single channel image
         color_im = 255*color_im.astype(np.float32)  # Make sure input is [0-255] and not [0-1]
         color_im = np.floor(color_im[..., 2]*self._color_const + color_im[..., 1]*256 + color_im[..., 0])
 
+        self.im = im
         self.color_im = color_im
         self.depth_im = depth_im
 
         # Update frame number
         if hasattr(self,'frame_id'):
-            assert self.frame_id + self.fopt.skip_rate == frame_id, "Updating image data failed. Previous frame not integrated"
-        else: 
-            self.frame_id = frame_id
+            assert self.frame_id + self.fopt.skip_rate == frame_id, f"Updating image data failed. Previous frame:{self.frame_id}, current frame:{frame_id} not integrated."
+            
+        self.frame_id = frame_id
 
 
 
     def get_depth_from_image(self,points):
         """
-            After projecting points to image space get their depth value 
+            After projecting points to source image space get their depth value 
         """
         # Project to image space 
         im_h,im_w = self.depth_im.shape
@@ -523,21 +522,31 @@ class TSDFVolume:
             returns: 
                 graph_dict
         """
-        # Deform graph nodes 
-        deformed_nodes = self.warpfield.get_deformed_graph_nodes()
-        # Check graph nodes visility in source image 
-        visible_nodes,depth_diff = self.check_visibility(deformed_nodes)
-        self.log.info(f"At timestep:{self.frame_id} total visible nodes:{np.sum(visible_nodes)}/{deformed_nodes.shape[0]} ")
+        if not hasattr(self,"reduced_graph_dict"): 
 
-        # print(depth_diff[~visible_nodes])
+            # Make sure source frame is being used for checking visibilty. 
+            # Hence warpfield and tsdf should have same frame id. This won't be true after integrating where tsdf which store target frame
+            assert self.warpfield.frame_id == self.frame_id 
+            # Deform graph nodes 
+            deformed_nodes = self.warpfield.get_deformed_graph_nodes()
+            # Check graph nodes visility in source image 
+            visible_nodes,depth_diff = self.check_visibility(deformed_nodes)
+            self.log.info(f"At timestep:{self.frame_id} total visible nodes:{np.sum(visible_nodes)}/{deformed_nodes.shape[0]} ")
 
-        reduced_graph_dict = self.graph.get_reduced_graph(visible_nodes)
+            # print(depth_diff[~visible_nodes])
+            reduced_graph_dict = self.graph.get_reduced_graph(visible_nodes)
 
-        # Update graph nodes with deformed graph nodes for registration
-        reduced_graph_dict["graph_nodes"] = deformed_nodes[visible_nodes]
-        reduced_graph_dict["visible_nodes"] = visible_nodes
+            # Update graph nodes with deformed graph nodes for registration
+            reduced_graph_dict["graph_nodes"] = deformed_nodes[visible_nodes]
 
-        return reduced_graph_dict
+
+            self.reduced_graph_dict = reduced_graph_dict
+
+            # Plot information incase of debug
+            # self.vis.plot_graph(color=visible_nodes,debug=True)
+
+
+        return self.reduced_graph_dict
 
 
 
@@ -604,7 +613,7 @@ class TSDFVolume:
 
         # Marching cubes
         # Create mask such that marching cubes runs only on that points, otherwise it would create 2 surfaces.
-        verts, faces, norms, vals = measure.marching_cubes_lewiner(tsdf_vol, mask=(weight_vol > 0), level=0)
+        verts, faces, norms, vals = measure.marching_cubes(tsdf_vol, mask=(weight_vol > 0), level=0)
 
         verts_ind = np.round(verts).astype(int)
         verts = verts*self._voxel_size+self._vol_origin  # voxel grid coordinates to world coordinates
@@ -637,7 +646,7 @@ class TSDFVolume:
         return False
 
 
-    def get_deformed_model():
+    def get_deformed_model(self):
         # Check mesh deformed with current frame 
         if hasattr(self,'deformed_model'): return self.deformed_model   
         
@@ -647,15 +656,10 @@ class TSDFVolume:
         # If not deform mesh
 
         # Deform 
-        if self.frame_id == self.fopt.source_frame: 
+        if self.frame_id != self.fopt.source_frame: 
             vertices,faces,normals,colors = self.get_canonical_model()
-            # Get skinning weights 
-            # Todo, this can be optimised such that skin is only computed for new vertices 
-            skin_anchors,skin_weights = self.warpfield.skin(vertices)
-
             # Get mesh and deform
-            deformed_vertices = self.warpfield.deform(vertices,skin_anchors,skin_weights)
-            deformed_normals = self.warpfield.deform_normals(normals,skin_anchors,skin_weights)
+            deformed_vertices,deformed_normals = self.warpfield.deform_mesh(vertices,normals)
             
             self.deformed_model = (deformed_vertices,faces,deformed_normals,colors)     
 
@@ -672,19 +676,18 @@ class TSDFVolume:
     def clear(self):
         """
             Remove data from previous frame registration to make sure consistant data is used cross modules
-        """ 
-        del self.color_im
-        del self.depth_im
+        """
+
+        # Clear image data
+        # del self.im
+        # del self.color_im
+        # del self.depth_im
+
+        # Clear graph data 
+        del self.reduced_graph_dict
+
+        # Clear mesh data
         del self.canonical_model
-        if self.frame_id > self.fopt.source_frame: 
-            del self.deformed_model
-
-
-
-
-
-
-
 
 
 # if __name__ == "__main__":

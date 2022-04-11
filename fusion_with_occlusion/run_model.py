@@ -3,7 +3,7 @@ import os
 import sys
 import torch
 import numpy as np
-
+import logging
 # Modules (make sure modules are visible in sys.path)
 from model.model import DeformNet
 
@@ -57,6 +57,9 @@ class Deformnet_runner():
 				exit()
 
 		self.model.eval()
+
+		# Set logging level 
+		self.log = logging.getLogger(__name__)
 
 	def __call__(self,source_data,target_data,graph_data,skin_data):
 		"""
@@ -121,9 +124,13 @@ class Deformnet_runner():
 		model_data["valid_correspondences"] = valid_correspondences.view(-1, opt.image_height, opt.image_width).cpu().numpy()
 		model_data["deformed_graph_nodes"] = graph_data["graph_nodes"] + model_data["node_translations"]
 
+		model_data["source_frame_id"] = source_data["id"]
+		model_data["target_frame_id"] = target_data["id"]
+
 		# TODO: ? Might be important later. 
 		del model_data["flow_data"]
 		
+
 		model_data = self.dict_to_numpy(model_data)
 
 		return model_data
@@ -154,13 +161,19 @@ class Deformnet_runner():
 			ARAP(as-rigid-as-possible) is used to find transformations 
 
 		"""
-		
+
 		visible_nodes = reduced_graph_dict["visible_nodes"]		
 		assert len(visible_nodes) == len(graph.nodes)
 		
+
+		# TODO assert to check edges are within range
 		N = len(graph.nodes)
 
-		graph_nodes = warpfield.deformed_graph_nodes
+		# Position of nodes at source frame
+		# For non-rigid alignment: source_frame = t-1
+		# For adding new nodes: source_frame = canonical frame 
+		# Make sure to update warpfield accordingly
+		graph_nodes = warpfield.deformed_graph_nodes 
 
 		R_current = np.tile(np.eye(3)[None],(N,1,1))
 		T_current = np.zeros((N,3))
@@ -170,38 +183,59 @@ class Deformnet_runner():
 
 		# Initialize based on 
 		non_visible_nodes = np.where(~visible_nodes)[0]
-		print("Non Visible nodes:",non_visible_nodes)
+		self.log.debug(f"Non Visible nodes:{non_visible_nodes}")
+
 		# Sort them based on number of neigbours in visible nodes
-		neigbours_visibility = np.sum(visible_nodes[graph.edges[non_visible_nodes]],axis=1) # Kx8
-		print("Neigbours visibility",neigbours_visibility)
+		num_edges = np.sum(graph.edges!=-1,axis=1)
+		neigbours_visibility = [ np.sum(visible_nodes[graph.edges[n,:num_edges[n]]]) for n in non_visible_nodes] # Kx8
+		self.log.debug(f"Neigbours visibility:{neigbours_visibility}")
 
 		sorted_indices = np.argsort(neigbours_visibility)
-		print("Sort:",non_visible_nodes[sorted_indices])
+		sorted_indices = list(sorted_indices[::-1]) # Use in descending order 
+		self.log.debug(f"Sort:{non_visible_nodes[sorted_indices]}")
 
 		updated_nodes = visible_nodes.copy()
-		for ind in sorted_indices[::-1]: # Use in descending order
+		while len(sorted_indices) > 0: # Use a que 
+			ind = sorted_indices.pop()
 
-			num_edges = graph.edges.shape[1] - np.sum(graph.edges[ind]==-1) # -1 values denote no edge 
 
-			updated_neighbours = graph.edges[ind,:num_edges]
+			updated_neighbours = graph.edges[ind,:num_edges[ind]]
 			updated_neighbours = np.where(updated_nodes[updated_neighbours])[0]
+
+
+			# If no closest neighbour 
+			if len(updated_neighbours) == 0:
+				self.log.debug(f"Fond no neigbours for:{ind}")
+				continue
+
+			# If all members of the queue have updated neighbours
+			# Means a seperate cluster has formed during adding nodes pahse 
+			# something is wrong with the code.
+			# Hence break. Need to ada a check if no all members have no neigbours 	
+				
 			# Find the closest neighbour
 			closest_neighbour = np.argmin(graph.edges_weights[ind,updated_neighbours])
 			closest_neighbour = graph.edges[ind,closest_neighbour]
 
+			
+
 			R_current[ind] = R_current[closest_neighbour]
 			T_current[ind] = R_current[ind]@(graph_nodes[ind]- graph_nodes[closest_neighbour])\
-								+ T_current[closest_neighbour]\
-								+ graph_nodes[closest_neighbour] - graph_nodes[ind]
- 
+								+ T_current[closest_neighbour]+ graph_nodes[closest_neighbour]\
+								- graph_nodes[ind]
+ 							# Difference due to rotations
+ 							# Difference due to tranlations
+ 							# w.r.t graph_nodes
+
 			updated_nodes[ind] = True
 
-		init_node_position_cuda   = torch.from_numpy(reduced_graph_dict["graph_nodes"]).cuda()		
-		deformed_node_position_cuda= torch.from_numpy(model_data["deformed_graph_nodes"]).cuda()		
+			
+		# For ARAP make sure to send 
+		source_node_position_cuda   = torch.from_numpy(reduced_graph_dict["graph_nodes"]).cuda()	 # Position of nodes at source frame	
+		target_node_position_cuda= torch.from_numpy(model_data["deformed_graph_nodes"]).cuda() # Position of nodes at target frame		
 
 		visible_nodes_indices_cuda= torch.from_numpy(np.where(visible_nodes)[0]).cuda()
 
-		graph_nodes_cuda          = torch.from_numpy(graph_nodes).cuda()
 		graph_edges_cuda          = torch.from_numpy(graph.edges).cuda()
 		graph_edges_weights_cuda  = torch.from_numpy(graph.edges_weights).cuda()
 		graph_clusters_cuda       = torch.from_numpy(graph.clusters).cuda().unsqueeze(0)
@@ -209,11 +243,13 @@ class Deformnet_runner():
 		R_current_cuda 			  =	torch.from_numpy(R_current).cuda()
 		T_current_cuda 			  =	torch.from_numpy(T_current).cuda()
 		# Update parameters of complete graph using as rigid as possible similar to embedded deformation 
-		arap_data = self.model.arap(visible_nodes_indices_cuda,init_node_position_cuda,deformed_node_position_cuda,\
-			graph_nodes_cuda,graph_edges_cuda,graph_edges_weights_cuda,graph_clusters_cuda,
+		arap_data = self.model.arap(visible_nodes_indices_cuda,source_node_position_cuda,target_node_position_cuda,\
+			graph_edges_cuda,graph_edges_weights_cuda,graph_clusters_cuda,
 			R_current_cuda,T_current_cuda)
 
 		arap_data = self.dict_to_numpy(arap_data)
-		arap_data["deformed_graph_nodes"] = graph_nodes + arap_data["node_translations"]
-
+		arap_data["deformed_graph_nodes"] = source_node_position_cuda + arap_data["node_translations"]
+		arap_data["source_frame_id"] = model_data["source_frame_id"]
+		arap_data["target_frame_id"] = model_data["target_frame_id"]
+ 
 		return arap_data

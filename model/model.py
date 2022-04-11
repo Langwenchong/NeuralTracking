@@ -91,7 +91,7 @@ class DeformNet(torch.nn.Module):
         self.gn_num_iter = 3
         self.gn_data_flow = 0.001
         self.gn_data_depth = 1.0
-        self.gn_arap = 1.0
+        self.gn_arap = 1
         self.gn_lm_factor = 0.1
 
         # Optimizer fails for > 3 iterations. Current hack is to stop update is loss increases by 1
@@ -549,6 +549,12 @@ class DeformNet(torch.nn.Module):
 
             ill_posed_system = False
 
+
+            # print("Valid Edges Weights",graph_edge_weights_pairs)
+            # print("Valid Edges", graph_edge_pairs_filtered)    
+
+            # print("Source Weights:",source_weights)
+            # print("Source anchors:",source_anchors)
             for gn_i in range(num_gn_iter):
 
                 if gn_i % 3 == 2:
@@ -570,6 +576,7 @@ class DeformNet(torch.nn.Module):
                     rotated_points_k = torch.matmul(R_current[node_idxs_k], source_points_filtered - nodes_k) # (num_matches, 3, 1) = (num_matches, 3, 3) * (num_matches, 3, 1)
                     deformed_points_k = rotated_points_k + nodes_k + t_current[node_idxs_k]
                     deformed_points += source_weights[:, k].view(num_matches, 1, 1).repeat(1, 3, 1) * deformed_points_k # (num_matches, 3, 1)
+
 
                 # Get necessary components of deformed points.
                 eps = 1e-7 # Just as good practice, although matches should all have valid depth at this stage
@@ -771,7 +778,7 @@ class DeformNet(torch.nn.Module):
                 convergence_info[i]["total"].append(loss_total)
 
                 # Increment the current rotation and translation.
-                R_inc = kornia.angle_axis_to_rotation_matrix(x[:opt_num_nodes_i*3].view(opt_num_nodes_i, 3))
+                R_inc = kornia.geometry.conversions.angle_axis_to_rotation_matrix(x[:opt_num_nodes_i*3].view(opt_num_nodes_i, 3))
                 t_inc = x[opt_num_nodes_i*3:].view(opt_num_nodes_i, 3, 1)
 
                 R_current = torch.matmul(R_inc, R_current)
@@ -885,11 +892,11 @@ class DeformNet(torch.nn.Module):
                 "deformed_points_subsampled":deformed_points_subsampled
             }, 
             "convergence_info": convergence_info,
-            "weight_info": weight_info
+            "weight_info": weight_info,
         }
 
-    def arap(self,visible_node_indices,init_node_position,target_node_position,\
-            graph_nodes,graph_edges,graph_edges_weights,graph_clusters,\
+    def arap(self,visible_node_indices,source_node_position,target_node_position,\
+            graph_edges,graph_edges_weights,graph_clusters,\
             R_current,t_current):
         
         # The parameters in GN solver are 3 parameters for rotation and 3 parameters for
@@ -898,8 +905,8 @@ class DeformNet(torch.nn.Module):
         #                        x = [w_current_all, t_current_all]
         
         # Initialization
-        device = init_node_position.device
-        dtype  = init_node_position.dtype
+        device = source_node_position.device
+        dtype  = source_node_position.dtype
 
         opt_num_nodes_i = R_current.shape[0]
         num_matches = len(visible_node_indices)
@@ -941,8 +948,9 @@ class DeformNet(torch.nn.Module):
         graph_edge_pairs_filtered = graph_edge_pairs[valid_edge_idxs[0], valid_edge_idxs[1], :].type(torch.int64)
         graph_edge_weights_pairs  = graph_edges_weights[valid_edge_idxs[0], valid_edge_idxs[1]]
         
-        # print("Valid Edges Weights",graph_edge_weights_pairs)
-        # print("Valid Edges", graph_edge_pairs_filtered)    
+        # print("Valid Edges Weights",graph_edge_weights_pairs.shape)
+        # print("Valid Edges", graph_edge_pairs_filtered[:,0])    
+        # print("Valid Edges", graph_edge_pairs_filtered[:,1])    
 
         num_edges_i = graph_edge_pairs_filtered.shape[0]
 
@@ -979,7 +987,7 @@ class DeformNet(torch.nn.Module):
         for gn_i in range(num_gn_iter):
 
             if gn_i % 3 == 2:
-                lm_factor /= 2;
+                lm_factor *= 2;
 
             timer_data_start = timer()
 
@@ -989,7 +997,8 @@ class DeformNet(torch.nn.Module):
             jacobian_data = torch.zeros((num_matches * 3, opt_num_nodes_i * 6), dtype=dtype, device=device) # (num_matches*3, opt_num_nodes_i*6)
             deformed_points = torch.zeros((num_matches, 3, 1), dtype=dtype, device=device) 
 
-            deformed_points = init_node_position[...,None] + t_current[visible_node_indices]
+            deformed_points = source_node_position[...,None] + t_current[visible_node_indices]
+            # print(source_node_position.shape,t_current[visible_node_indices].shape)
 
 
             # Get necessary components of deformed points.
@@ -1006,9 +1015,9 @@ class DeformNet(torch.nn.Module):
 
             # Compute jacobian wrt. TRANSLATION.
             # FLOW PART
-            jacobian_data[data_increment_vec_0_3, 3 * opt_num_nodes_i + 3 * node_idxs_k + 0] += lambda_data_flow * weights_k * (deformed_points[:, 0, :] - target_node_position[:, 0, None]).view(num_matches) # (num_matches)
-            jacobian_data[data_increment_vec_1_3, 3 * opt_num_nodes_i + 3 * node_idxs_k + 1] += lambda_data_flow * weights_k * (deformed_points[:, 1, :] - target_node_position[:, 1, None]).view(num_matches) # (num_matches)
-            jacobian_data[data_increment_vec_2_3, 3 * opt_num_nodes_i + 3 * node_idxs_k + 2] += lambda_data_flow * weights_k * (deformed_points[:, 1, :] - target_node_position[:, 1, None]).view(num_matches) # (num_matches)
+            jacobian_data[data_increment_vec_0_3, 3 * opt_num_nodes_i + 3 * node_idxs_k + 0] += lambda_data_flow * weights_k * (deformed_points[:, 0, :] - target_node_position[:, 0, None]).view(num_matches) # x(num_matches)
+            jacobian_data[data_increment_vec_1_3, 3 * opt_num_nodes_i + 3 * node_idxs_k + 1] += lambda_data_flow * weights_k * (deformed_points[:, 1, :] - target_node_position[:, 1, None]).view(num_matches) # y(num_matches)
+            jacobian_data[data_increment_vec_2_3, 3 * opt_num_nodes_i + 3 * node_idxs_k + 2] += lambda_data_flow * weights_k * (deformed_points[:, 2, :] - target_node_position[:, 2, None]).view(num_matches) # z(num_matches)
 
             assert torch.isfinite(jacobian_data).all(), jacobian_data
 
@@ -1042,6 +1051,10 @@ class DeformNet(torch.nn.Module):
                 w_repeat        = w.unsqueeze(-1).repeat(1, 3).unsqueeze(-1)
                 w_repeat_repeat = w_repeat.repeat(1, 1, 3)
 
+                # print("Nodes shape:",graph_nodes.shape)
+                # print(graph_nodes[node_idxs_0].shape)
+                # print(graph_nodes[node_idxs_0].view(num_edges_i, 3, 1).shape)
+
                 nodes_0 = graph_nodes[node_idxs_0].view(num_edges_i, 3, 1)
                 nodes_1 = graph_nodes[node_idxs_1].view(num_edges_i, 3, 1)
 
@@ -1054,6 +1067,7 @@ class DeformNet(torch.nn.Module):
                 jacobian_arap[arap_increment_vec_0_3, 3 * opt_num_nodes_i + 3 * node_idxs_0 + 0] += lambda_arap * w * arap_one_vec # (num_edges_i)
                 jacobian_arap[arap_increment_vec_1_3, 3 * opt_num_nodes_i + 3 * node_idxs_0 + 1] += lambda_arap * w * arap_one_vec # (num_edges_i)
                 jacobian_arap[arap_increment_vec_2_3, 3 * opt_num_nodes_i + 3 * node_idxs_0 + 2] += lambda_arap * w * arap_one_vec # (num_edges_i)
+
 
                 jacobian_arap[arap_increment_vec_0_3, 3 * opt_num_nodes_i + 3 * node_idxs_1 + 0] += -lambda_arap * w * arap_one_vec # (num_edges_i)
                 jacobian_arap[arap_increment_vec_1_3, 3 * opt_num_nodes_i + 3 * node_idxs_1 + 1] += -lambda_arap * w * arap_one_vec # (num_edges_i)
@@ -1158,11 +1172,17 @@ class DeformNet(torch.nn.Module):
             convergence_info["total"].append(loss_total)
 
             # Increment the current rotation and translation.
-            R_inc = kornia.angle_axis_to_rotation_matrix(x[:opt_num_nodes_i*3].view(opt_num_nodes_i, 3))
+            R_inc = kornia.geometry.conversions.angle_axis_to_rotation_matrix(x[:opt_num_nodes_i*3].view(opt_num_nodes_i, 3))
             t_inc = x[opt_num_nodes_i*3:].view(opt_num_nodes_i, 3, 1)
 
-            R_current = torch.matmul(R_inc, R_current)
-            t_current = t_current + t_inc
+
+            print("Invisible Nodes:")
+            print("Updating Transformations of:",~visible_node_indices)
+            print(R_current[~visible_node_indices].shape,R_inc[~visible_node_indices].shape)
+            print(t_current[~visible_node_indices].shape,t_inc[~visible_node_indices].shape)
+
+            R_current[~visible_node_indices] = torch.matmul(R_inc[~visible_node_indices], R_current[~visible_node_indices])
+            t_current[~visible_node_indices] = t_current[~visible_node_indices] + t_inc[~visible_node_indices]
 
 
             if num_edges_i > 0:
@@ -1202,7 +1222,7 @@ class DeformNet(torch.nn.Module):
 
         return {"node_rotations": node_rotations,
             "node_translations": node_translations,
-            "deformed_nodes": deformed_points,
+            "deformed_": deformed_points,
             "valid_solve": valid_solve, 
             "convergence_info": convergence_info,
             }
