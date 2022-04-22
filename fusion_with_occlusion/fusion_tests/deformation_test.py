@@ -79,7 +79,7 @@ def test1(use_gpu=True,debug=False):
 
 		graph_deformation_data['target_frame_id'] =  i
 		graph_deformation_data["node_translations"][:,[2]] = 0
-		graph_deformation_data['deformed_graph_nodes'] = warpfield.deformed_graph_nodes + graph_deformation_data['node_translations']
+		graph_deformation_data['deformed_nodes_to_target'] = warpfield.deformed_nodes + graph_deformation_data['node_translations']
 
 
 		warpfield.update_transformations(graph_deformation_data)
@@ -152,7 +152,7 @@ def test2(use_gpu=True,debug=False):
 
 
 		graph_deformation_data['target_frame_id'] = i
-		graph_deformation_data['deformed_graph_nodes'] = warpfield.deformed_graph_nodes + graph_deformation_data['node_translations']
+		graph_deformation_data['deformed_nodes_to_target'] = warpfield.deformed_nodes + graph_deformation_data['node_translations']
 
 
 		warpfield.update_transformations(graph_deformation_data)

@@ -1,4 +1,5 @@
 # Python Imports
+import os
 import numpy as np
 import open3d as o3d
 
@@ -32,19 +33,19 @@ class VisualizeOpen3D(Visualizer):
 
 		print(f"::{title} Debug:{debug}")	
 		if debug: 
-			self.vis = o3d.visualization.Visualizer()
-			self.vis.create_window(width=1280, height=960,window_name="Fusion Pipeline")
-
+			self.vis_debug = o3d.visualization.Visualizer()
+			self.vis_debug.create_window(width=1280, height=960,window_name="Fusion Pipeline")
+			
 			for o in object_list:
-				self.vis.add_geometry(o)
+				self.vis_debug.add_geometry(o)
 
-			self.vis.run() # Plot and halt the program
-			self.vis.destroy_window()
-			self.vis.close()
+			self.vis_debug.run() # Plot and halt the program
+			self.vis_debug.destroy_window()
+			self.vis_debug.close()
 
 		else:
 			if hasattr(self,'vis'):
-				self.vis.clear_geometries() # Clear previous data
+				self.vis.clear_geometries() # Clear previous dataq
 			else:	
 				# Create visualization object
 				self.vis = o3d.visualization.Visualizer()
@@ -117,7 +118,7 @@ class VisualizeOpen3D(Visualizer):
 		assert hasattr(self,'tsdf'),  "TSDF not defined. Add tsdf as attribute to visualizer first." 
 		assert hasattr(self.tsdf,'reduced_graph_dict'),  "Visible nodes not calculated. Can't show reduded graph" 
 
-		nodes = self.tsdf.reduced_graph_dict["graph_nodes"]
+		nodes = self.tsdf.reduced_graph_dict["valid_nodes_at_source"]
 		edges = self.tsdf.reduced_graph_dict["graph_edges"]
 		
 		rendered_graph = self.get_rendered_graph(nodes,edges,trans=trans)
@@ -127,10 +128,10 @@ class VisualizeOpen3D(Visualizer):
 		assert hasattr(self,'tsdf'),  "TSDF not defined. Add tsdf as attribute to visualizer first." 
 		assert hasattr(self,'warpfield'),  "Warpfield not defined. Add warpfield as attribute to visualizer first." 
 		
-		nodes = self.warpfield.get_deformed_graph_nodes()
+		nodes = self.warpfield.get_deformed_nodes()
 		edges = self.warpfield.graph.edges
 
-		color = self.tsdf.reduced_graph_dict["visible_nodes"]
+		color = self.tsdf.reduced_graph_dict["valid_nodes_mask"]
 
 		return self.get_rendered_graph(nodes,edges,color=color,trans=trans)
 
@@ -168,7 +169,34 @@ class VisualizeOpen3D(Visualizer):
 
 		return target_pcd
 
+
 	# Make functions defined in sub-classes based on method used 
+	def plot_skinned_model(self,debug=True):
+		"""
+			Plot the skinning of the mesh 
+		"""	
+
+		color_list = self.get_color(np.arange(self.graph.nodes.shape[0]+1)) # Common color for graph and mesh 
+		color_list[-1] = 0. # Last/Background color is black
+		print(color_list)
+		rendered_graph = self.get_rendered_graph(self.graph.nodes,self.graph.edges,color=color_list,trans=np.array([0,0,0.01]))
+		
+		verts, faces, normals, _ = self.tsdf.get_mesh()  # Extract the new canonical pose using marching cubes
+		vert_anchors,vert_weights,valid_verts = self.warpfield.skin(verts)
+		print(valid_verts)
+		mesh_colors = np.array([vert_weights[i,:]@color_list[vert_anchors[i,:],:] for i in range(verts.shape[0])])
+		
+		reshape_gpu_vol = [verts.shape[0],1,1]        
+		deformed_vertices = self.warpfield.deform(verts,vert_anchors,vert_weights,reshape_gpu_vol,valid_verts)    
+
+		mesh = self.get_mesh(deformed_vertices,faces,color=mesh_colors,normals=normals)	
+
+
+
+
+		self.plot([mesh] + rendered_graph,"Skinned Object",debug=debug)
+
+
 	def plot_graph(self,color,title="Embedded Graph",debug=False):
 		"""
 			@parama:
@@ -228,7 +256,7 @@ class VisualizeOpen3D(Visualizer):
 
 		# Source warped
 		warped_deform_pred_3d_np = image_proc.warp_deform_3d(
-			source_frame_data["im"], skin_data["pixel_anchors"], skin_data["pixel_weights"], graph_data["graph_nodes"],
+			source_frame_data["im"], skin_data["pixel_anchors"], skin_data["pixel_weights"], graph_data["valid_nodes_at_source"],
 			model_data["node_rotations"], model_data["node_translations"]
 		)
 
@@ -245,7 +273,7 @@ class VisualizeOpen3D(Visualizer):
 		# GRAPH #
 		####################################
 		rendered_graph = viz_utils.create_open3d_graph(
-			viz_utils.transform_pointcloud_to_opengl_coords(graph_data["graph_nodes"] + model_data["node_translations"]), graph_data["graph_edges"])
+			viz_utils.transform_pointcloud_to_opengl_coords(graph_data["valid_nodes_at_source"] + model_data["node_translations"]), graph_data["graph_edges"])
 
 		# Correspondences
 		# Mask
@@ -330,19 +358,20 @@ class VisualizeOpen3D(Visualizer):
 			self.bbox = (source_pcd.get_max_bound() - source_pcd.get_min_bound())
 
 		bbox = self.bbox
-		rendered_reduced_graph_nodes,rendered_reduced_graph_edges = self.get_rendered_reduced_graph(trans=np.array([0.0, 0, 0.01]) * bbox)
+		rendered_reduced_graph_nodes,rendered_reduced_graph_edges = self.get_rendered_reduced_graph(trans=np.array([0.0, 0, 0.03]) * bbox)
 
 		# Top right 
-		target_pcd = self.get_target_RGBD(trans=np.array([1.5, 0, 0]) * bbox)
+		target_pcd = self.get_target_RGBD(trans=np.array([1.0, 0, 0]) * bbox)
 
 		# Bottom left
-		canonical_mesh = self.get_model_from_tsdf(trans=np.array([0, -1.5, 0]) * bbox)
-		rendered_graph_nodes,rendered_graph_edges = self.get_rendered_graph(self.graph.nodes,self.graph.edges,trans=np.array([0, -1.5, 0.01]) * bbox)
+		canonical_mesh = self.get_model_from_tsdf(trans=np.array([0, -1.0, 0]) * bbox)
+		rendered_graph_nodes,rendered_graph_edges = self.get_rendered_graph(self.graph.nodes,self.graph.edges,trans=np.array([0, -1.0, 0.01]) * bbox)
 
 		# Bottom right
-		# deformed_mesh = self.get_deformed_model_from_tsdf(trans=np.array([1.5, -1.5, 0]) * bbox)
-		deformed_mesh = self.get_deformed_model_from_tsdf(trans=np.array([1.5, -1.5, 0]) * bbox)
-		# rendered_deformed_nodes,rendered_deformed_edges = self.get_rendered_graph(self.warpfield.get_deformed_graph_nodes(),self.graph.edges,trans=np.array([1.5, -1.5, 0.01]) * bbox)
+		deformed_mesh = self.get_deformed_model_from_tsdf(trans=np.array([1.0, -1.0, 0]) * bbox)
+		# rendered_reduced_graph_nodes2,rendered_reduced_graph_edges2 = self.get_rendered_reduced_graph(trans=np.array([1.5, -1.5, 0.01]) * bbox)
+		# rendered_deformed_nodes,rendered_deformed_edges = self.get_rendered_graph(self.warpfield.get_deformed_nodes(),self.graph.edges,trans=np.array([1.5, -1.5, 0.01]) * bbox)
+
 		# Add matches
 		# print(matches)
 		# trans = np.array([0, 0, 0]) * bbox
@@ -357,3 +386,6 @@ class VisualizeOpen3D(Visualizer):
 			canonical_mesh,rendered_graph_nodes,rendered_graph_edges,\
 			deformed_mesh],"Showing frame",debug)
 
+		image_path = os.path.join(self.savepath,"images",f"{self.tsdf.frame_id}.png")
+		if not os.path.isfile(image_path):
+			self.vis.capture_screen_image(image_path) # TODO: Returns segfault

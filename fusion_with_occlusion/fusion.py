@@ -7,11 +7,6 @@ import logging # To log info
 
 
 sys.path.append("../")  # Making it easier to load modules
-# Neural Tracking Modules
-# from utils import image_proc
-# import utils.viz_utils as viz_utils
-# import utils.line_mesh as line_mesh_utils
-
 
 # Fusion Modules 
 from frame_loader import RGBDVideoLoader
@@ -113,7 +108,7 @@ class DynamicFusion:
 		
 		# Obtain reduced graph based on visibility of graph nodes in source frame. Graph nodes are already deformed 
 		reduced_graph_dict = self.tsdf.get_reduced_graph() # Assuming previous frame was used as source 
-		skin_data		   = self.warpfield.skin_image(reduced_graph_dict["graph_nodes"],source_frame_data)
+		skin_data		   = self.warpfield.skin_image(reduced_graph_dict["valid_nodes_at_source"],source_frame_data)
 
 		# Compute optical flow and estimate transformation for graph using neural tracking
 		estimated_reduced_graph_parameters = self.model(source_frame_data,\
@@ -136,10 +131,13 @@ class DynamicFusion:
 		# Register TSDF, tsdf maps to target frame  
 		self.tsdf.integrate(target_frame_data)
 
-		# Add new nodes to warpfield and graph if any
-		update = self.warpfield.update_graph() 
+		# self.vis.plot_skinned_model()
 
-		self.vis.show(debug=source_frame > 100) # plot registration details 
+		# Add new nodes to warpfield and graph if any
+		# update = self.warpfield.update_graph() 
+		update = False
+		
+		self.vis.show(debug=False) # plot registration details 
 
 		# Return whether sucess or failed in registering 
 		return True, f"Registered {source_frame}th frame to {target_frame}th frame. Added graph nodes:{update}"

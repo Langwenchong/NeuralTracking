@@ -8,6 +8,8 @@ import numpy as np
 import logging 
 
 from numba import njit, prange
+from numba.types import bool_ # Required for calculating truncated region, np.bool inside numbda doesn't work 
+
 import torch
 from skimage import measure
 import skimage
@@ -23,17 +25,12 @@ except Exception as err:
     print('Failed to import PyCUDA. Running fusion in CPU mode.')
     FUSION_GPU_MODE = 0
 
-# CPU module imports
-from pykdtree.kdtree import KDTree as KDTreeCPU
-
 # Modules
 sys.path.append("../")
 import options as opt
 
 
 torch.cuda.init()  # any torch cuda initialization before pycuda calls, torch.randn(10).cuda() works too
-
-
 
 class TSDFVolume:
     """
@@ -76,7 +73,7 @@ class TSDFVolume:
         # Define voxel volume parameters
         self._vol_bnds = vol_bnds
         self._voxel_size = float(voxel_size)
-        self._trunc_margin = 5 * self._voxel_size  # truncation on SDF
+        self._trunc_margin = 10 * self._voxel_size  # truncation on SDF
         # TODO needs to be estimated correctly, causing more nodes to be added to graph. See Dynamic Fusion Section 4.2 
         self._color_const = 256 * 256
 
@@ -329,7 +326,6 @@ class TSDFVolume:
 
         # Update image information in TSDF class, need to be stored for future applications  
         self.update(image_data["im"],image_data["id"]) # Now tsdf maps to the target frame 
-
         cam_pose = np.eye(4)  # TODO For future if we want to integrate varying camera pose too
 
         # Deform 
@@ -340,7 +336,7 @@ class TSDFVolume:
 
         else:
             cam_pts,valid_points = self.warpfield.deform_tsdf()   
-        
+            
         # Begin integration 
         im_h, im_w = self.depth_im.shape
         if self.gpu_mode:  # GPU mode: integrate voxel volume (calls CUDA kernel)
@@ -528,7 +524,7 @@ class TSDFVolume:
             # Hence warpfield and tsdf should have same frame id. This won't be true after integrating where tsdf which store target frame
             assert self.warpfield.frame_id == self.frame_id 
             # Deform graph nodes 
-            deformed_nodes = self.warpfield.get_deformed_graph_nodes()
+            deformed_nodes = self.warpfield.get_deformed_nodes()
             # Check graph nodes visility in source image 
             visible_nodes,depth_diff = self.check_visibility(deformed_nodes)
             self.log.info(f"At timestep:{self.frame_id} total visible nodes:{np.sum(visible_nodes)}/{deformed_nodes.shape[0]} ")
@@ -537,14 +533,14 @@ class TSDFVolume:
             reduced_graph_dict = self.graph.get_reduced_graph(visible_nodes)
 
             # Update graph nodes with deformed graph nodes for registration
-            reduced_graph_dict["graph_nodes"] = deformed_nodes[visible_nodes]
+            reduced_graph_dict["all_nodes_at_source"] = deformed_nodes
+            reduced_graph_dict["valid_nodes_at_source"] = deformed_nodes[visible_nodes]
 
 
             self.reduced_graph_dict = reduced_graph_dict
 
             # Plot information incase of debug
             # self.vis.plot_graph(color=visible_nodes,debug=True)
-
 
         return self.reduced_graph_dict
 
@@ -581,6 +577,46 @@ class TSDFVolume:
             cuda.memcpy_htod(self._color_vol_gpu, self._color_vol_cpu)
             pycuda_ctx.pop()
 
+    @staticmethod
+    @njit(parallel=True)
+    def compute_truncated_region(tsdf_vol,max_diff):
+        """
+            Find truncated region in tsdf, 
+            Truncated region will be utilized as mask for running marching cubes 
+            Otherwise marching cubes returns a manifold due to 2-zero crossing 
+            The 2nd is created because backside has -1 values 
+            whereas surrounding region has not been updated and contains 1 
+            
+            @params: 
+                tsdf_vol: np.ndarray TSDF Volume, containing truncated signed distance values across the grid
+                max_diff: max distance allowed between sdf 
+        """
+        truncated_region = np.ones_like(tsdf_vol, dtype=bool_)
+        W,H,D = tsdf_vol.shape
+        for i in prange(W*H*D):
+            w = i//(H*W)
+            h = (i//D)%H
+            d = i%D
+
+            # If not calculated region skip  
+            if tsdf_vol[w,h,d] == 1.:
+                truncated_region[w,h,d] = False
+                continue
+            
+            # Boundary of tsdf not part of truncated region
+            if d == 0 or d == D-1 or h == 0 or h == H-1 or w == 0 or w == W-1:
+                truncated_region[w,h,d] = False
+                continue    
+
+            # Check all sides of the cube 
+            for dw in range(-1,2):
+                for dh in range(-1,2):
+                    for dd in range(-1,2):
+                        if abs(tsdf_vol[w+dw,h+dh,d+dd] - tsdf_vol[w,h,d]) > max_diff: 
+                            truncated_region[w,h,d] = False                                                                        
+
+        return truncated_region
+
 
     def get_point_cloud(self):
         """
@@ -609,11 +645,11 @@ class TSDFVolume:
         """
         tsdf_vol, color_vol,weight_vol = self.get_volume()
 
-        # print(tsdf_vol[tsdf_vol.shape[0]//2,tsdf_vol.shape[1]//2,:])
-
-        # Marching cubes
-        # Create mask such that marching cubes runs only on that points, otherwise it would create 2 surfaces.
-        verts, faces, norms, vals = measure.marching_cubes(tsdf_vol, mask=(weight_vol > 0), level=0)
+        # self.log.debug(tsdf_vol[tsdf_vol.shape[0]//2,tsdf_vol.shape[1]//2,:])
+        
+        diff_tsdf = self.compute_truncated_region(tsdf_vol,1.2) # Check all sides of voxel 
+        # self.log.debug(diff_tsdf[diff_tsdf.shape[0]//2,diff_tsdf.shape[1]//2,:])
+        verts, faces, norms, vals = measure.marching_cubes(tsdf_vol, mask=diff_tsdf, level=0) # Level denotes the crossing. Here its 0 cro
 
         verts_ind = np.round(verts).astype(int)
         verts = verts*self._voxel_size+self._vol_origin  # voxel grid coordinates to world coordinates
@@ -658,6 +694,7 @@ class TSDFVolume:
         # Deform 
         if self.frame_id != self.fopt.source_frame: 
             vertices,faces,normals,colors = self.get_canonical_model()
+            print("Getting Called")
             # Get mesh and deform
             deformed_vertices,deformed_normals = self.warpfield.deform_mesh(vertices,normals)
             
@@ -687,144 +724,5 @@ class TSDFVolume:
         del self.reduced_graph_dict
 
         # Clear mesh data
+        del self.deformed_model
         del self.canonical_model
-
-
-# if __name__ == "__main__":
-#   # Simple Test cases for the module
-#   from mpl_toolkits import mplot3d
-#   import matplotlib.pyplot as plt
-#   from scipy.spatial.transform import Rotation as R
-
-    """
-        Case 1: 
-            Voxel Grid = 3x3 Cube
-            Deformable Graph = 1-single node
-
-            Deformation: Rotating and translating in all axis
-
-    """
-    # opt.image_width = 3
-    # opt.image_height = 3
-    # max_depth = 3
-    # voxel_size = 1
-    # cam_intr = [3, 3, 1.5, 1.5]
-    # graph_dict = {
-    #   'graph_nodes' : np.array([[-0.5, -0.5, 1.0]], dtype=np.float32),
-    #   'node_coverage' : 1.0,
-    #   'graph_neighbours': 1
-    # }
-
-    # tsdf = TSDFVolume(max_depth, voxel_size, cam_intr, graph_dict, gpu=True)
-
-    # fig = plt.figure()
-    # ax = fig.add_subplot(111, projection='3d')
-
-    # azim = 0
-    # elev = -15
-
-    # def mouse_click(event):
-    #   azim = ax.azim
-    #   elev = ax.elev
-
-    # fig.canvas.mpl_connect('button_press_event', mouse_click)
-
-    # # Deformation 3
-    # for i, deg in enumerate(range(0, 180, 3)):
-    #   plt.cla()
-    #   r =  R.from_rotvec([0.4*deg*np.pi/180, 0.4*deg*np.pi/180, 0.4*deg*np.pi/180])
-    #   graph_deformation_data = {
-    #       'node_rotations' : np.array([r.as_matrix()]),
-    #       'node_translations' : 3*i*np.ones((1,3))/180
-    #   }
-
-
-    #   new_world_points = tsdf.warpfield.deform_tsdf(graph_deformation_data['node_rotations'], graph_deformation_data['node_translations'])
-    #   print(np.where(np.linalg.norm(tsdf.warpfield.world_pts - new_world_points,axis=-1).reshape((3,3,3))))
-    #   # Plot results
-    #   ax.view_init(azim=azim, elev=elev)
-    #   ax.axis('off')
-    #   ax.scatter(tsdf.warpfield.world_pts[:, 0], tsdf.warpfield.world_pts[:, 1], tsdf.warpfield.world_pts[:, 2], marker='s', s=500, c="red")
-    #   ax.scatter(new_world_points[:, 0], new_world_points[:, 1], new_world_points[:, 2], marker='s', s=500)
-    #   ax.scatter(graph_dict["graph_nodes"][:, 0], graph_dict["graph_nodes"][:, 1], graph_dict["graph_nodes"][:, 2], s=50, c="black")
-    #   ax.set_xlim([-1.5, 1.5])
-    #   ax.set_ylim([-1.5, 1.5])
-    #   ax.set_zlim([-1.5, 1.5])
-
-    #   plt.draw()
-    #   plt.pause(0001.001)
-
-    """
-        Case 2: 
-            Voxel Grid = L-shape 
-            Deformable Graph = 3-single node
-
-            Deformation: 
-                1. Rotating the graph node center node by similar to elbow movement to create a straight voxel
-                2. Translating end graph nodes to extend the cube
-
-    """
-
-    # opt.image_width = 3
-    # opt.image_height = 3
-    # max_depth = 3
-    # voxel_size = 1
-    # cam_intr = [3, 3, 1.5, 1.5]
-    # graph_dict = {
-    #   'graph_nodes' : np.array([  [-0.5, -0.5, 1.0],
-    #                               [-3.5, -0.5, 1.0],
-    #                               [-6.5, -0.5, 1.0],
-    #                               [-0.5, -3.5, 1.0]], dtype=np.float32),
-    #   'node_coverage' : 1.5,
-    #   'graph_neighbours' : 4
-
-    # }
-
-    # tsdf = TSDFVolume(max_depth, voxel_size, cam_intr, graph_dict, gpu=True)
-    # tsdf.warpfield.world_pts = np.concatenate([   tsdf.warpfield.world_pts,
-    #                                           tsdf.warpfield.world_pts + np.array([-3, 0, 0]),
-    #                                           tsdf.warpfield.world_pts + np.array([-6, 0, 0]),
-    #                                           tsdf.warpfield.world_pts + np.array([0, -3, 0])], axis=0).astype(np.float32)
-    # tsdf._vol_dim = (12,3,3)
-
-    # fig = plt.figure()
-    # ax = fig.add_subplot(111, projection='3d')
-    # azim = 0
-    # elev = 90
-
-    # def mouse_click(event):
-    #   azim = ax.azim
-    #   elev = ax.elev
-
-    # fig.canvas.mpl_connect('button_press_event', mouse_click)
-
-    # # Deformation 1
-    # for i, deg in enumerate(range(0, 90, 2)):
-    #   plt.cla()
-    #   r = R.from_rotvec([0, 0, -deg*np.pi/180])
-    #   graph_deformation_data = {
-    #       'node_rotations': np.array([r.as_matrix(), r.as_matrix(), r.as_matrix(), np.eye(3)]),
-    #       'node_translations': np.array(  [[0, 0, 0],
-    #                                       [deg*4/90, deg*5/90, 0],
-    #                                       [deg*7/90, deg*8/90, 0],
-    #                                       [0, 0, 0]])
-    #   }
-
-    #   new_world_points = tsdf.warpfield.deform_tsdf(graph_deformation_data['node_rotations'],
-    #                                                   graph_deformation_data['node_translations'])
-    #   # Plot results
-    #   ax.view_init(azim=azim, elev=elev)
-    #   ax.axis('off')
-    #   ax.scatter(tsdf.warpfield.world_pts[:, 0],
-    #               tsdf.warpfield.world_pts[:, 1],
-    #               tsdf.warpfield.world_pts[:, 2], marker='s', s=500, c="red")
-    #   ax.scatter(new_world_points[:, 0], new_world_points[:, 1], new_world_points[:, 2], marker='s', s=500)
-    #   ax.scatter(graph_dict["graph_nodes"][:, 0] + graph_deformation_data["node_translations"][:, 0],
-    #               graph_dict["graph_nodes"][:, 1] + graph_deformation_data["node_translations"][:, 1],
-    #               graph_dict["graph_nodes"][:, 2] + graph_deformation_data["node_translations"][:, 2], s=50, c="black")
-    #   ax.set_xlim([-7.5, 1.5])
-    #   ax.set_ylim([-4.5, 1.5])
-    #   ax.set_zlim([-1.5, 1.5])
-
-    #   plt.draw()
-    #   plt.pause(00.101)

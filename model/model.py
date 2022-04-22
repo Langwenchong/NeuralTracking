@@ -88,11 +88,24 @@ class DeformNet(torch.nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.gn_num_iter = 3
-        self.gn_data_flow = 0.001
-        self.gn_data_depth = 1.0
-        self.gn_arap = 1
-        self.gn_lm_factor = 0.1
+        self.gn_num_iter = 6
+
+        # Controls the x,y position of deforomed nodes based on the optical flow
+        # if too low, x,y position don't update
+        # If too high overshadows depth term hence deformed nodes unable to be present on the surface of target nodes
+        self.gn_data_flow = 0.001  
+
+        # Controls the depth term of deformed nodes positiong, 
+        # if too low overshadowed by data term hence nodes don't reach the surface of the deformed node, eventaully leading to them becoming invisible nodes
+        # if too high reduces the effect of ARAP regularization 
+        self.gn_data_depth = 1  
+
+        # Forces adjacent nodes to move rigidly, i.e is maintain distance between them irrecpective of transformations
+        # If too low deformed nodes can move to random position and hence tsdf doesn't deform correctly 
+        self.gn_arap = 10 
+
+        # Limiting factor, acts as a regularizer
+        self.gn_lm_factor = 10
 
         # Optimizer fails for > 3 iterations. Current hack is to stop update is loss increases by 1
         self.stop_loss_diff = 1
@@ -128,6 +141,7 @@ class DeformNet(torch.nn.Module):
 
     def forward(
         self, x1, x2, 
+        original_graph_nodes,
         graph_nodes, graph_edges, graph_edges_weights, graph_clusters,
         pixel_anchors, pixel_weights, 
         num_nodes_vec, intrinsics, 
@@ -334,6 +348,7 @@ class DeformNet(torch.nn.Module):
 
             timer_start = timer()
 
+            original_graph_nodes_i= original_graph_nodes[i,:num_nodes_i,:]
             graph_nodes_i         = graph_nodes[i, :num_nodes_i, :]             # (num_nodes_i, 3)
             graph_edges_i         = graph_edges[i, :num_nodes_i, :]             # (num_nodes_i, 8)
             graph_edges_weights_i = graph_edges_weights[i, :num_nodes_i, :]     # (num_nodes_i, 8)
@@ -662,8 +677,8 @@ class DeformNet(torch.nn.Module):
                     w_repeat        = w.unsqueeze(-1).repeat(1, 3).unsqueeze(-1)
                     w_repeat_repeat = w_repeat.repeat(1, 1, 3)
 
-                    nodes_0 = graph_nodes_i[node_idxs_0].view(num_edges_i, 3, 1)
-                    nodes_1 = graph_nodes_i[node_idxs_1].view(num_edges_i, 3, 1)
+                    nodes_0 = original_graph_nodes_i[node_idxs_0].view(num_edges_i, 3, 1)
+                    nodes_1 = original_graph_nodes_i[node_idxs_1].view(num_edges_i, 3, 1)
 
                     # Compute residual.
                     rotated_node_delta = torch.matmul(R_current[node_idxs_0], nodes_1 - nodes_0) # (num_edges_i, 3)
@@ -772,6 +787,9 @@ class DeformNet(torch.nn.Module):
                 if len(convergence_info[i]["total"]): 
                     if loss_total - convergence_info[i]["total"][-1] > self.stop_loss_diff:
                         print("As loss is greater than before breaking optimization")
+                        break
+                    if loss_total == convergence_info[i]["total"][-1]:
+                        print("loss not changing")
                         break
 
                 convergence_info[i]["data"].append(loss_data)
@@ -895,10 +913,20 @@ class DeformNet(torch.nn.Module):
             "weight_info": weight_info,
         }
 
-    def arap(self,visible_node_indices,source_node_position,target_node_position,\
+    def arap(self,graph_nodes,source_node_position,target_node_position,\
+            valid_nodes_mask,
+            original_graph_nodes,
             graph_edges,graph_edges_weights,graph_clusters,\
             R_current,t_current):
-        
+        """
+            Main module to run ARAP using pytorch 
+            @params: 
+                graph_nodes: torch.cuda.Tensor: Nx3: Position of graph nodes at source
+                source_node_position: torch.cuda.Tensor: Mx3: Position of valid graph nodes at source
+                target_node_position: torch.cuda.Tensor: Mx3: Position of valid graph nodes at target
+        """
+
+
         # The parameters in GN solver are 3 parameters for rotation and 3 parameters for
         # translation for every node. All node rotation parameters are listed first, and
         # then all node translation parameters are listed.
@@ -908,8 +936,10 @@ class DeformNet(torch.nn.Module):
         device = source_node_position.device
         dtype  = source_node_position.dtype
 
+        valid_node_indices = torch.where(valid_nodes_mask)[0]
+
         opt_num_nodes_i = R_current.shape[0]
-        num_matches = len(visible_node_indices)
+        num_matches = len(valid_node_indices)
         num_neighbors = graph_edges.shape[1]
 
         R_current = torch.tensor(R_current,dtype=dtype,device=device).view(opt_num_nodes_i, 3, 3)
@@ -987,7 +1017,7 @@ class DeformNet(torch.nn.Module):
         for gn_i in range(num_gn_iter):
 
             if gn_i % 3 == 2:
-                lm_factor *= 2;
+                lm_factor /= 2;
 
             timer_data_start = timer()
 
@@ -997,8 +1027,8 @@ class DeformNet(torch.nn.Module):
             jacobian_data = torch.zeros((num_matches * 3, opt_num_nodes_i * 6), dtype=dtype, device=device) # (num_matches*3, opt_num_nodes_i*6)
             deformed_points = torch.zeros((num_matches, 3, 1), dtype=dtype, device=device) 
 
-            deformed_points = source_node_position[...,None] + t_current[visible_node_indices]
-            # print(source_node_position.shape,t_current[visible_node_indices].shape)
+            deformed_points = source_node_position[...,None] + t_current[valid_node_indices]
+            # print(source_node_position.shape,t_current[valid_node_indices].inshape)
 
 
             # Get necessary components of deformed points.
@@ -1008,8 +1038,8 @@ class DeformNet(torch.nn.Module):
             deformed_y = deformed_points[:, 1, :].view(num_matches) # (num_matches)
             deformed_z = deformed_points[:, 2, :].view(num_matches) # (num_matches)
 
-            node_idxs_k = visible_node_indices # (num_matches)
-            nodes_k = graph_nodes[node_idxs_k].view(num_matches, 3, 1) # (num_matches, 3, 1)
+            node_idxs_k = valid_node_indices # (num_matches)
+            nodes_k = graph_nodes[node_idxs_k].view(num_matches, 3, 1) # (innum_matches, 3, 1)
 
             weights_k = torch.ones((num_matches), dtype=dtype, device=device) # (num_matches)
 
@@ -1055,13 +1085,14 @@ class DeformNet(torch.nn.Module):
                 # print(graph_nodes[node_idxs_0].shape)
                 # print(graph_nodes[node_idxs_0].view(num_edges_i, 3, 1).shape)
 
-                nodes_0 = graph_nodes[node_idxs_0].view(num_edges_i, 3, 1)
-                nodes_1 = graph_nodes[node_idxs_1].view(num_edges_i, 3, 1)
+                nodes_0 = original_graph_nodes[node_idxs_0].view(num_edges_i, 3, 1)
+                nodes_1 = original_graph_nodes[node_idxs_1].view(num_edges_i, 3, 1)
 
                 # Compute residual.
                 rotated_node_delta = torch.matmul(R_current[node_idxs_0], nodes_1 - nodes_0) # (num_edges_i, 3)
                 res_arap = lambda_arap * w_repeat * (rotated_node_delta + nodes_0 + t_current[node_idxs_0] - (nodes_1 + t_current[node_idxs_1]))
                 res_arap = res_arap.view(num_edges_i * 3, 1)
+
 
                 # Compute jacobian wrt. translations.
                 jacobian_arap[arap_increment_vec_0_3, 3 * opt_num_nodes_i + 3 * node_idxs_0 + 0] += lambda_arap * w * arap_one_vec # (num_edges_i)
@@ -1158,7 +1189,7 @@ class DeformNet(torch.nn.Module):
                 convergence_info["errors"].append("Solver failed: Non-finite solution x!")
                 break
         
-            if opt.gn_print_timings: print("\t\tLinear solve: {:.3f} s".format(timer() - timer_solve_start))
+            if opt.gn_print_timings: print("\tLinear solve: {:.3f} s".format(timer() - timer_solve_start))
                 
             loss_data = torch.norm(res_data).item()
             loss_total = torch.norm(res).item()
@@ -1168,6 +1199,10 @@ class DeformNet(torch.nn.Module):
                     print("As loss is greater than before breaking optimization")
                     break
 
+                if loss_total == convergence_info["total"][-1]:
+                        print("loss not changing")
+                        break
+
             convergence_info["data"].append(loss_data)
             convergence_info["total"].append(loss_total)
 
@@ -1175,14 +1210,14 @@ class DeformNet(torch.nn.Module):
             R_inc = kornia.geometry.conversions.angle_axis_to_rotation_matrix(x[:opt_num_nodes_i*3].view(opt_num_nodes_i, 3))
             t_inc = x[opt_num_nodes_i*3:].view(opt_num_nodes_i, 3, 1)
 
+            invalid_node_indices = torch.where(~valid_nodes_mask)[0]
+            # print("Invisible Nodes:")
+            # print("Updating Transformations of:",invalid_node_indices)
+            # print(R_current[invalid_node_indices].shape,R_inc[invalid_node_indices].shape)
+            # print(t_current[invalid_node_indices].shape,t_inc[invalid_node_indices].shape)
 
-            print("Invisible Nodes:")
-            print("Updating Transformations of:",~visible_node_indices)
-            print(R_current[~visible_node_indices].shape,R_inc[~visible_node_indices].shape)
-            print(t_current[~visible_node_indices].shape,t_inc[~visible_node_indices].shape)
-
-            R_current[~visible_node_indices] = torch.matmul(R_inc[~visible_node_indices], R_current[~visible_node_indices])
-            t_current[~visible_node_indices] = t_current[~visible_node_indices] + t_inc[~visible_node_indices]
+            R_current[invalid_node_indices] = torch.matmul(R_inc[invalid_node_indices], R_current[invalid_node_indices])
+            t_current[invalid_node_indices] = t_current[invalid_node_indices] + t_inc[invalid_node_indices]
 
 
             if num_edges_i > 0:
@@ -1222,7 +1257,7 @@ class DeformNet(torch.nn.Module):
 
         return {"node_rotations": node_rotations,
             "node_translations": node_translations,
-            "deformed_": deformed_points,
+            "deformed_nodes_to_target": deformed_points,
             "valid_solve": valid_solve, 
             "convergence_info": convergence_info,
             }

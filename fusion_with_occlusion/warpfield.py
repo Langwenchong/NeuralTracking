@@ -46,7 +46,7 @@ class WarpField:
         self.source_frame_kdtree = KDTreeCPU(self.graph.nodes, leafsize=self.kdtree_leaf_size) # Update the main kdtree 
         self.rotations = np.tile(np.eye(3,dtype=np.float32).reshape((1,3,3)),(N,1,1))
         self.translations = np.zeros((N,3),dtype=np.float32)
-        self.deformed_graph_nodes = self.graph.nodes.copy() # Stores the deformed node positions. Note these are w.r.t source frame  
+        self.deformed_nodes = self.graph.nodes.copy() # Stores the deformed node positions. Note these are w.r.t source frame  
 
         # Boolean variable to check whether warpfield is updating or not after addinf new nodes
         self.updating_warpfield = False 
@@ -375,21 +375,21 @@ class WarpField:
         # Assert warpfield and tsdf map to same frame (source frame). Aftet updating warpfield will map to target frame   
         assert self.frame_id == self.tsdf.frame_id,f"Warpfield maps to:{self.frame_id}th frame but TSDF maps to:{self.tsdf.frame_id}th frame"
 
-        assert self.rotations.shape[0] == self.deformed_graph_nodes.shape[0],f"Nodes mismatch between transformation data:{self.rotations.shape} and deformed node:{self.deformed_graph_nodes.shape} data"
+        assert self.rotations.shape[0] == self.deformed_nodes.shape[0],f"Nodes mismatch between transformation data:{self.rotations.shape} and deformed node:{self.deformed_nodes.shape} data"
         # Update deformed_nodes
-        N = self.deformed_graph_nodes.shape[0]
+        N = self.deformed_nodes.shape[0]
 
         # Update transformation paramaeters to get transformation from source frame to target frame of all nodes
         # Make sure to update translations first, so we can use previous rotations
         self.translations = np.array([ nnrt_data["node_rotations"][i]@self.translations[i]for i in range(N)])\
-                            - np.array([ nnrt_data["node_rotations"][i]@self.deformed_graph_nodes[i] for i in range(N)])\
-                            + self.deformed_graph_nodes + nnrt_data["node_translations"]
+                            - np.array([ nnrt_data["node_rotations"][i]@self.deformed_nodes[i] for i in range(N)])\
+                            + self.deformed_nodes + nnrt_data["node_translations"]
 
         # Since                     
         self.rotations = np.array([ nnrt_data["node_rotations"][i]@self.rotations[i]for i in range(N)])
 
         # Finally update graph nodes
-        self.deformed_graph_nodes = nnrt_data["deformed_graph_nodes"]                            
+        self.deformed_nodes = nnrt_data["deformed_nodes_to_target"]                            
         self.frame_id = nnrt_data["target_frame_id"]
 
     def get_transformation_wrt_graph_node(self):
@@ -434,20 +434,19 @@ class WarpField:
         dist, nearest_node = self.source_frame_kdtree.query(points, k=1)
         dist = dist.reshape(-1)
         unreachable_verts = np.where(dist > self.node_coverage)[0]
-        print("Unreachable nodes:",unreachable_verts)
+        self.log.debug("Unreachable nodes:",unreachable_verts)
         if len(unreachable_verts) == 0:
-            return np.zeros((0,3)) # Empty array 
+            return [] # Empty array 
 
 
         # Sort vertices by their distance to graph 
         dist = dist[unreachable_verts]
         dist_arg_sort = np.argsort(dist)[::-1]
-        print("Dist:")
-        print("Sorted by their distance:",dist_arg_sort)
+        self.log.debug("Dist:")
+        self.log.debug("Sorted by their distance:",dist_arg_sort)
         unreachable_verts = unreachable_verts[dist_arg_sort]
 
-        new_verts = points[unreachable_verts]
-        return new_verts 
+        return unreachable_verts 
 
     def update_graph(self):
         """
@@ -472,10 +471,10 @@ class WarpField:
 
 
         # Get vertices not skinned, sorted by their ditance from graph 
-        new_verts = self.find_unreachable_nodes(canonical_model_vertices[canonical_model_non_eroded_indices])
+        new_verts_indices = self.find_unreachable_nodes(canonical_model_vertices[canonical_model_non_eroded_indices])
         
         old_num_nodes = self.graph.nodes.shape[0]
-        update = self.graph.update(new_verts) # Update graph and return whether succesfully updated or not 
+        update = self.graph.update(canonical_model_vertices,canonical_model_faces,new_verts_indices) # Update graph and return whether succesfully updated or not 
 
         if update:
             ##################################
@@ -488,14 +487,11 @@ class WarpField:
             # Update deformation parameters  #
             ##################################
 
-            visible_nodes = np.zeros(self.graph.nodes.shape[0],dtype=np.bool)
-            visible_nodes[:old_num_nodes] = True
+            valid_nodes_mask = np.zeros(self.graph.nodes.shape[0],dtype=np.bool)
+            valid_nodes_mask[:old_num_nodes] = True
 
-            graph_data = self.graph.get_reduced_graph(visible_nodes) # Get all nodes 
-
-
-            # Note
-            graph_data["graph_nodes"] = graph_data["nodes"] # While running ARAP to add nodes, source_frame = canonical frame adding
+            # While running ARAP to add nodes, source_frame = canonical frame adding
+            graph_data = self.graph.get_reduced_graph(valid_nodes_mask) # Get all nodes 
 
             # for k in graph_data:
             #     try: 
@@ -505,13 +501,12 @@ class WarpField:
 
             transformation_data = {"source_frame_id":self.tsdf.fopt.source_frame,"target_frame_id":self.frame_id}
             transformation_data["node_rotations"],transformation_data["node_translations"] = self.get_transformation_wrt_graph_node() # Get their transformations     
-            transformation_data["deformed_graph_nodes"] = self.graph.nodes[visible_nodes] + transformation_data["node_translations"]    
+            transformation_data["deformed_nodes_to_target"] = self.graph.nodes[valid_nodes_mask] + transformation_data["node_translations"]    
 
             estimated_new_graph_parameters = self.model.run_arap(graph_data,transformation_data,self.graph,self)
 
-            # TODO: Needs refactoring  
-            self.deformed_graph_nodes = self.graph.nodes + estimated_new_graph_parameters["node_translations"] # Just update graph nodes (Unlike during registration no need to save previous data)
-
+            # Update parameters
+            self.deformed_nodes = estimated_new_graph_parameters["deformed_nodes_to_target"] # Just update graph nodes (Unlike during registration no need to save previous data)
             self.rotations,self.translations = self.get_transformation_wrt_origin(estimated_new_graph_parameters["node_rotations"],estimated_new_graph_parameters["node_translations"])
 
 
@@ -524,7 +519,7 @@ class WarpField:
         return update
 
 
-    def get_deformed_graph_nodes(self):
+    def get_deformed_nodes(self):
 
         # Make sure the translation nodes are updated 
         assert self.frame_id == self.tsdf.frame_id,f"Warpfield maps to:{self.frame_id}th frame but TSDF maps to:{self.tsdf.frame_id}th frame" # Assert warpfield updated with previous deformation 
@@ -532,7 +527,7 @@ class WarpField:
 
         # TODO checks for  
 
-        return self.deformed_graph_nodes
+        return self.deformed_nodes
 
     def save_deformation_parameters(self):
         pass

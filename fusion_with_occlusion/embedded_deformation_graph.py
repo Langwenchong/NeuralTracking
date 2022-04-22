@@ -7,18 +7,20 @@ from skimage import io
 from timeit import default_timer as timer
 import re
 
+from queue import PriorityQueue # For finding geodesic distance 
+
+
+
 # Neural Tracking Modules
 from model import dataset
-from utils import utils, image_proc
+from utils import utils
 
-from NeuralNRT._C import compute_mesh_from_depth_and_flow as compute_mesh_from_depth_and_flow_c
+# Neural Tracking C compiled modules
 from NeuralNRT._C import erode_mesh as erode_mesh_c
 from NeuralNRT._C import sample_nodes as sample_nodes_c
 from NeuralNRT._C import compute_edges_geodesic as compute_edges_geodesic_c
 from NeuralNRT._C import node_and_edge_clean_up as node_and_edge_clean_up_c
-from NeuralNRT._C import compute_pixel_anchors_geodesic as compute_pixel_anchors_geodesic_c
 from NeuralNRT._C import compute_clusters as compute_clusters_c
-from NeuralNRT._C import update_pixel_anchors as update_pixel_anchors_c
 
 class EDGraph: 
     def __init__(self,tsdf,visualizer):
@@ -56,10 +58,11 @@ class EDGraph:
                 # based on the depth values, a perticular vertex could be far away from its adjacent pairs in for a particular face/triangle
                 # `max_triangle_distance` controls this. For a sperical surfaces (such as a dolls, human body) this should be set high. But for clothes this can be small      
                 'max_triangle_distance' : 0.05, 
-                'erosion_num_iterations': 10,   # Will reduce outliers points (simliar to erosion in images)
-                'erosion_min_neighbors' : 4,    # Will reduce outlier clusters
+                'erosion_num_iterations': 1,   # Will reduce outliers points (simliar to erosion in images)
+                'erosion_min_neighbours' : 4,    # Will reduce outlier clusters
                 'node_coverage'         : 0.05, # Sampling parameter which defines the number of nodes
-                'min_neighbours'        : 2,    # Find minimum nunber of neigbours that must be present for ech node     
+                'min_neighbours'        : 2,    # Find minimum nunber of neighbours that must be present for ech node     
+                'num_neighbours'        : 8,    # Maximum number of neighbours
                 'require_mask'          : True,
                 }
 
@@ -68,7 +71,7 @@ class EDGraph:
         
         assert hasattr(self,'tsdf'),  "TSDF not defined in graph. Add tsdf as attribute to EDGraph first." 
         vertices, faces, normals, colors = self.tsdf.get_mesh()  # Extract the new canonical pose using marching cubes
-
+        self.log.debug(f"Creating graph from mesh. Vertices:{vertices.shape} Faces:{faces.shape}")
         self.create_graph_from_mesh(vertices,faces)
 
 
@@ -147,7 +150,7 @@ class EDGraph:
         non_eroded_vertices = erode_mesh_c(
             vertices, faces,\
             num_iterations,\
-            self.graph_generation_parameters["erosion_min_neighbors"])
+            self.graph_generation_parameters["erosion_min_neighbours"])
         return non_eroded_vertices
 
     def create_graph_from_mesh(self,vertices,faces):
@@ -155,9 +158,6 @@ class EDGraph:
         # Node sampling and edges computation
         USE_ONLY_VALID_VERTICES = True
         NODE_COVERAGE = self.graph_generation_parameters["node_coverage"]
-        NUM_NEIGHBORS = 8
-        ENFORCE_TOTAL_NUM_NEIGHBORS = False
-        SAMPLE_RANDOM_SHUFFLE = False
 
         num_vertices = vertices.shape[0]
         num_faces = faces.shape[0]
@@ -173,6 +173,7 @@ class EDGraph:
         valid_vertices = non_eroded_vertices
 
         
+        SAMPLE_RANDOM_SHUFFLE = False
         # Sample graph nodes.
         node_coords = np.zeros((0), dtype=np.float32)
         node_indices = np.zeros((0), dtype=np.int32)
@@ -192,6 +193,8 @@ class EDGraph:
         # pcd_nodes = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(node_coords))
         # o3d.visualization.draw_geometries([pcd_nodes], mesh_show_back_face=True)
 
+        ENFORCE_TOTAL_NUM_NEIGHBORS = False
+        NUM_NEIGHBORS = self.graph_generation_parameters["num_neighbours"]
         #########################################################################
         # Compute graph edges.
         #########################################################################
@@ -217,47 +220,54 @@ class EDGraph:
         self.node_indices    = node_indices # Which vertex correspondes to graph node in the original mesh
         self.edges           = graph_edges 
         self.edges_weights   = graph_edges_weights 
-        self.edges_distances = graph_edges_distances                  
+        self.edges_distances = graph_edges_distances
         self.clusters = -np.ones((graph_edges.shape[0], 1), dtype=np.int32) # Will be calculated later 
 
         # self.node_to_vertex_distances = node_to_vertex_distances # Not required except for edge calculatation    
+        self.remove_nodes_with_not_enough_neighbours()
 
+        #########################################################################
+        # Compute clusters.
+        #########################################################################
+        self.compute_clusters()
+
+    
+    def remove_nodes_with_not_enough_neighbours(self):    
 
         # Cluster nodes in graph
         NEIGHBORHOOD_DEPTH = 2
         MIN_CLUSTER_SIZE = 3
 
-        MIN_NUM_NEIGHBORS = 2
+        MIN_NUM_NEIGHBORS = self.graph_generation_parameters["min_neighbours"]
         REMOVE_NODES_WITH_NOT_ENOUGH_NEIGHBORS = True
+
+        num_nodes = self.nodes.shape[0]
 
         # Remove nodes 
         valid_nodes_mask = np.ones((num_nodes, 1), dtype=bool)
         node_id_black_list = []
 
         if REMOVE_NODES_WITH_NOT_ENOUGH_NEIGHBORS:
-            # Mark nodes with not enough neighbors
-            node_and_edge_clean_up_c(graph_edges, valid_nodes_mask)
+            # Mark nodes with not enough neighbours
+            node_and_edge_clean_up_c(self.edges, valid_nodes_mask)
         else:
-            self.log.info("You're allowing nodes with not enough neighbors!")
+            self.log.info("You're allowing nodes with not enough neighbours!")
 
         # Remove black listed nodes
         reduced_graph_dict = self.get_reduced_graph(valid_nodes_mask)
 
         # Remove invalid graph
-        self.nodes           = reduced_graph_dict["nodes"]
+        self.nodes           = reduced_graph_dict["valid_nodes_at_source"]
         self.edges           = reduced_graph_dict["graph_edges"] 
         self.edges_weights   = reduced_graph_dict["graph_edges_weights"] 
         self.edges_distances = reduced_graph_dict["graph_edges_distances"]                  
         self.clusters  = reduced_graph_dict["graph_clusters"] 
         self.num_nodes = np.array(num_nodes, dtype=np.int64)
         # self.node_to_vertex_distances = reduced_graph_dict["node_to_vertex_distances"] # Not required 
-        #########################################################################
-        # Compute clusters.
-        #########################################################################
-        self.compute_clusters()
+
 
         # Done manually only at the start 
-        self.node_indices    = node_indices[reduced_graph_dict["visible_nodes"]] # Which vertex correspondes to graph node
+        self.node_indices    = self.node_indices[reduced_graph_dict["valid_nodes_mask"]] # Which vertex correspondes to graph node
 
 
     def compute_clusters(self):
@@ -310,20 +320,20 @@ class EDGraph:
 
             # 2. Update graph_edges using the id mapping
             for node_id, graph_edge in enumerate(graph_edges):
-                # compute mask of valid neighbors
+                # compute mask of valid neighbours
                 valid_neighboring_nodes = np.invert(np.isin(graph_edge, node_id_black_list))
 
-                # make a copy of the current neighbors' ids
+                # make a copy of the current neighbours' ids
                 graph_edge_copy           = np.copy(graph_edge)
                 graph_edge_weights_copy   = np.copy(graph_edges_weights[node_id])
                 graph_edge_distances_copy = np.copy(graph_edges_distances[node_id])
 
-                # set the neighbors' ids to -1
+                # set the neighbours' ids to -1
                 graph_edges[node_id]           = -np.ones_like(graph_edge_copy)
                 graph_edges_weights[node_id]   =  np.zeros_like(graph_edge_weights_copy)
                 graph_edges_distances[node_id] =  np.zeros_like(graph_edge_distances_copy)
 
-                count_valid_neighbors = 0
+                count_valid_neighbours = 0
                 for neighbor_idx, is_valid_neighbor in enumerate(valid_neighboring_nodes):
                     if is_valid_neighbor:
                         # current neighbor id
@@ -333,11 +343,11 @@ class EDGraph:
                         if current_neighbor_id == -1: mapped_neighbor_id = -1
                         else:                         mapped_neighbor_id = node_id_mapping[current_neighbor_id]    
 
-                        graph_edges[node_id, count_valid_neighbors]           = mapped_neighbor_id
-                        graph_edges_weights[node_id, count_valid_neighbors]   = graph_edge_weights_copy[neighbor_idx]
-                        graph_edges_distances[node_id, count_valid_neighbors] = graph_edge_distances_copy[neighbor_idx]
+                        graph_edges[node_id, count_valid_neighbours]           = mapped_neighbor_id
+                        graph_edges_weights[node_id, count_valid_neighbours]   = graph_edge_weights_copy[neighbor_idx]
+                        graph_edges_distances[node_id, count_valid_neighbours] = graph_edge_distances_copy[neighbor_idx]
 
-                        count_valid_neighbors += 1
+                        count_valid_neighbours += 1
 
                 # normalize edges' weights
                 sum_weights = np.sum(graph_edges_weights[node_id])
@@ -349,18 +359,21 @@ class EDGraph:
                 #     print("Hmmmmm", graph_edges_weights[node_id])
                 #     raise Exception("Not good")
 
+
+
         # TODO: Check if some cluster is not present in reduced nodes. Then exit or raise error  
 
         reduced_graph_dict = {} # Store graph dict 
 
-        reduced_graph_dict["nodes"]                 = node_coords
+        reduced_graph_dict["all_nodes_at_source"]   = self.nodes.copy() # Not nessacary, copying just for safety
+        reduced_graph_dict["valid_nodes_at_source"] = node_coords
         reduced_graph_dict["graph_edges"]           = graph_edges 
         reduced_graph_dict["graph_edges_weights"]   = graph_edges_weights 
         reduced_graph_dict["graph_edges_distances"] = graph_edges_distances                  
         reduced_graph_dict["graph_clusters"]        = graph_clusters                  
 
         reduced_graph_dict["num_nodes"]             = np.array(num_nodes, dtype=np.int64) # Number of nodes in this graph
-        reduced_graph_dict["visible_nodes"]         = valid_nodes_mask 
+        reduced_graph_dict["valid_nodes_mask"]         = valid_nodes_mask 
         # reduced_graph_dict["node_to_vertex_distances"] = node_to_vertex_distances # NxV geodesic distance between vertices of mesh and graph nodes
 
         return reduced_graph_dict
@@ -377,134 +390,104 @@ class EDGraph:
         diff = np.linalg.norm(diff, axis=2)
         return diff
 
-    def update(self,new_verts,plot_update=False):
+    def update(self,canonical_model_vertices,canonical_model_faces,new_verts_indices,plot_update=False):
         """
             Given vertices which are have outside the coverage of the graph. 
             Sample nodes and create edges betweem them and old graph
 
             @params: 
-                new_verts: (Nx3) np.ndarry: New vertices from which nodes are sampled
+                canonical_model_vertices: (Vx3) np.ndarray (float32): Vertices of the updated canonical model
+                canonical_model_faces:    (Fx3) np.ndarray (int32)  : Faces of the model     
+                new_verts_indices: (Nx3) np.ndarry: New vertices indices from which nodes are sampled
 
             @returns: 
                 update: bool: Whether new nodes were added to graph     
         """
 
-        if len(new_verts) == 0: 
+        if len(new_verts_indices) == 0: 
             return False
 
+
         node_coverage = self.graph_generation_parameters["node_coverage"]
-        min_neighbours = self.graph_generation_parameters["min_neighbours"]
 
         # Sample nodes such that they are node_coverage apart from one another 
-        new_node_list = []
-        for i, x in enumerate(new_verts):
-            if len(new_node_list) == 0:
-                new_node_list.append(i)
+        new_node_indices = []
+        for x in new_verts_indices:
+            if len(new_node_indices) == 0:
+                new_node_indices.append(x)
                 continue
 
             # If node already covered
-            min_nodes_dist = np.min(np.linalg.norm(new_verts[new_node_list] - x, axis=1))
+            min_nodes_dist = np.min(np.linalg.norm(canonical_model_vertices[new_node_indices] - canonical_model_vertices[x], axis=1))
             if min_nodes_dist < node_coverage: # Not sure if correct
                 continue
-            self.log.debug(f"Node:{i},Min dists:{min_nodes_dist}")
+            self.log.debug(f"Node:{len(new_node_indices)},Vertex index:{x},Min dists:{min_nodes_dist}")
 
+            new_node_indices.append(x)
 
-            # If previous graph nodeos are closer
-            # min_nodes_dist = np.min(np.linalg.norm(new_verts[new_node_list] - x, axis=1))
-
-            # else:
-            new_node_list.append(i)
-        self.log.debug(f"New Node List:{new_node_list,len(new_node_list)}")
-        if len(new_node_list) == 0: # No new nodes were added
+        self.log.debug(f"New Node vertex indexes:{new_node_indices,len(new_node_indices)}")
+        if len(new_node_indices) == 0: # No new nodes were added
             return False
 
+        self.nodes = np.concatenate([self.nodes, canonical_model_vertices[new_node_indices]], axis=0)
 
+        # Update self.node_indices using the new canonical model and old graph nodes 
+        old_nodes_distance_matrix = self.calculate_distance_matrix(self.nodes,canonical_model_vertices)
+        self.log.debug("New Node distance")
+        self.node_indices = np.argmin(old_nodes_distance_matrix,axis=1)
+        self.log.debug(f"Node Indices:{len(self.node_indices)}")
+        self.log.debug(f"{self.node_indices}")                  
+        self.node_indices = self.node_indices[:,None] # Required in Nx1 format for getting reduced graph
 
-        while True:  # Remove new_nodes with <= 4 neighbors (selected by experimentation)
+        # Compute new graph edges 
+        # (TODO very computationally expensive. 
+        # Takes O(F + V*N + V*N), 
+        #   calculating vertex neighbours, 
+        #   finding new node indices for the updated canonical model, 
+        #   using priority que for adding new graph edges)
+        num_nodes = self.nodes.shape[0]
+        num_vertices = canonical_model_vertices.shape[0]
+        min_neighbours = self.graph_generation_parameters["min_neighbours"]
+        num_neighbours = self.graph_generation_parameters["num_neighbours"]
+        USE_ONLY_VALID_VERTICES = True
+        ENFORCE_TOTAL_NUM_NEIGHBORS = False
+        
+        #########################################################################
+        # Compute graph edges.
+        #########################################################################
+        # Compute edges between nodes.
+        graph_edges              = -np.ones((num_nodes, num_neighbours), dtype=np.int32)
+        graph_edges_weights      =  np.zeros((num_nodes, num_neighbours), dtype=np.float32)
+        graph_edges_distances    =  np.zeros((num_nodes, num_neighbours), dtype=np.float32)
+        node_to_vertex_distances = -np.ones((num_nodes, num_vertices), dtype=np.float32)
 
-            # Find their co-ordinates, initialize for later use 
-            new_node_coords = new_verts[new_node_list]
-            self.log.debug(f"New Node Coords:{new_node_coords}")
+        visible_vertices = np.ones_like(canonical_model_vertices)
 
-            updated_nodes = np.concatenate([self.nodes, new_node_coords], axis=0)
+        compute_edges_geodesic_c(
+            canonical_model_vertices, visible_vertices, canonical_model_faces, self.node_indices, 
+            num_neighbours, node_coverage, 
+            graph_edges, graph_edges_weights, graph_edges_distances,
+            node_to_vertex_distances,
+            USE_ONLY_VALID_VERTICES,
+            ENFORCE_TOTAL_NUM_NEIGHBORS
+        )
 
-            # Find Distance matrix for new nodes and graph 
-            new_node_distance_matrix = self.calculate_distance_matrix(new_node_coords, updated_nodes)
-            nn_nodes = np.argsort(new_node_distance_matrix, axis=1)[:, 1:9]  # First eight neighbours (0th index represents same point)
+        # Save current results 
+        self.edges           = graph_edges 
+        self.edges_weights   = graph_edges_weights 
+        self.edges_distances = graph_edges_distances
+        self.clusters = -np.ones((graph_edges.shape[0], 1), dtype=np.int32) # Will be calculated later 
 
-            nn_dists = np.array([new_node_distance_matrix[i, nn_nodes[i, :]] for i in range(nn_nodes.shape[0]) ])
-            self.log.debug(f"Neighbouring nodes distance:{nn_dists}")
+        # self.node_to_vertex_distances = node_to_vertex_distances # Not required except for edge calculatation    
+        self.remove_nodes_with_not_enough_neighbours()
 
-            nn_nodes[nn_dists > 2*node_coverage] = -1
-            removable_nodes_mask = np.where(np.sum(nn_nodes != -1, axis=1) <= min_neighbours)[0]
-            self.log.debug(f"Neighbouring nodes:{nn_nodes} Minimum Neighbours:{min_neighbours}")
-            
-            self.log.debug(f"Removable node indices:{removable_nodes_mask}")
+        #########################################################################
+        # Compute clusters.
+        #########################################################################
+        self.compute_clusters()
 
-            # If no nodes need to be removed, exit loop
-            if len(removable_nodes_mask) == 0:
-                break
-
-            new_node_list = np.delete(new_node_list, removable_nodes_mask)
-            self.log.debug(f"Removing nodes as they don't have enough neighbors:{removable_nodes_mask}")
-
-            # If no new nodes need to be added, Return 
-            if len(new_node_list) == 0:
-                return False
-
-        self.log.debug(f"Adding Nodes:{new_node_list}")
-
-        if plot_update:
-            vis = o3d.visualization.Visualizer()
-            vis.create_window(width=1280, height=960)
-
-            old_graph = viz_utils.create_open3d_graph(
-                viz_utils.transform_pointcloud_to_opengl_coords(graph_data["graph_nodes"]),
-                graph_data["graph_edges"])
-            new_regions = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(
-                viz_utils.transform_pointcloud_to_opengl_coords(new_verts)))
-            new_regions.colors = o3d.utility.Vector3dVector(np.tile(np.array([[1,0,0]]),(new_verts.shape[0],1)))
-
-            new_node_pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(
-                viz_utils.transform_pointcloud_to_opengl_coords(new_verts[new_node_list])))
-            new_node_pc.colors = o3d.utility.Vector3dVector(np.tile(np.array([[0,0,1]]),(len(new_node_list),1)))
-
-            vis.add_geometry(old_graph[0])
-            vis.add_geometry(old_graph[1])
-            vis.add_geometry(new_regions)
-            vis.add_geometry(new_node_pc)
-
-            vis.run()
-            vis.close()
-
-
-        # Update graph data
-        self.nodes = np.concatenate([self.nodes, new_verts[new_node_list]], axis=0)
-        self.edges = np.concatenate([self.edges, nn_nodes], axis=0)
-        self.edges_distances = np.concatenate([self.edges_distances, nn_dists], axis=0)
-
-        nn_weights = nn_dists.copy()
-        nn_weights[nn_weights == -1] = np.inf # Updating dists to calculate weights
-        nn_weights = np.exp(-0.5 * (nn_dists / node_coverage) ** 2)
-        nn_weights /= np.sum(nn_weights, axis=1, keepdims=True)
-        self.edges_weights = np.concatenate([self.edges_weights, nn_weights], axis=0)
-
-
-        self.clusters = -np.ones((self.edges.shape[0], 1), dtype=np.int32)
-        clusters_size_list = compute_clusters_c(self.edges, self.clusters)
-
-        for i, cluster_size in enumerate(clusters_size_list):
-            if cluster_size <= 2:
-                print("Cluster is too small {}".format(clusters_size_list))
-                nodes_to_remove = np.where(graph_data["graph_clusters"] == i)[0]
-                print("It only has nodes:", nodes_to_remove, " removing them.")
-                
-                graph_data = remove_nodes(graph_data,nodes_to_remove)
-
-
-
-
-
+        # I tried implementing the whole update thing. But the results are basically the same. 
+        # Its better to use neural tracking setup. :) (This smile represents the time wasted on the whole thing)
 
         return True
 
@@ -596,7 +579,7 @@ class EDGraph:
                 os.path.join(self.seq_dir,"depth",self.images_path[index].replace('jpg','png')),\
                 max_triangle_distance=self.graph_generation_parameters['max_triangle_distance'],\
                 erosion_num_iterations=self.graph_generation_parameters['erosion_num_iterations'],\
-                erosion_min_neighbors=self.graph_generation_parameters['erosion_min_neighbors'],\
+                erosion_min_neighbours=self.graph_generation_parameters['erosion_min_neighbours'],\
                 node_coverage=self.graph_generation_parameters['node_coverage'],\
                 require_mask=self.graph_generation_parameters['require_mask']
                 )
@@ -642,8 +625,6 @@ class EDGraph:
 
 
 
-
-
 if __name__ == "__main__":
     #########################################################################
     # Options
@@ -671,19 +652,6 @@ if __name__ == "__main__":
 
     # Node clean-up
     REMOVE_NODES_WITH_NOT_ENOUGH_NEIGHBORS = True
-
-    #########################################################################
-    # Paths.
-    #########################################################################
-    seq_dir = os.path.join("example_data" , "train", "seq258")
-
-    depth_image_path = os.path.join(seq_dir, "depth", "000000.png")
-    mask_image_path = os.path.join(seq_dir, "mask", "000000_shirt.png")
-    scene_flow_path = os.path.join(seq_dir, "scene_flow", "shirt_000000_000110.sflow")
-    intrinsics_path = os.path.join(seq_dir, "intrinsics.txt")
-
-    pair_name = "generated_shirt_000000_000110"
-
 
 
 

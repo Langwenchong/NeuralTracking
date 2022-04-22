@@ -57,7 +57,7 @@ class VisualizeMatplotlib(Visualizer):
 
 		self.ax.axis('off')
 		self.ax.scatter(new_world_points[:, 0], new_world_points[:, 1], new_world_points[:, 2], marker='s', s=500,alpha=0.05)
-		self.ax.scatter(self.warpfield.deformed_graph_nodes[:, 0], self.warpfield.deformed_graph_nodes[:, 1], self.warpfield.deformed_graph_nodes[:, 2], s=100, c="green",alpha=1)
+		self.ax.scatter(self.warpfield.deformed_nodes[:, 0], self.warpfield.deformed_nodes[:, 1], self.warpfield.deformed_nodes[:, 2], s=100, c="green",alpha=1)
 		self.ax.scatter(self.tsdf.world_pts[:, 0], self.tsdf.world_pts[:, 1], self.tsdf.world_pts[:, 2], marker='s', s=500, c="red",alpha=0.05)
 
 		self.ax.set_title(self.title)

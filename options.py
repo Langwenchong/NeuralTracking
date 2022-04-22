@@ -5,9 +5,10 @@ import pwd
 #####################################################################################################################
 # dataset_base_dir    = "/cluster/lothlann/data/nonrigid/public/"
 user = pwd.getpwuid(os.getuid())[0]
-dataset_base_dir    = f"/media/{user}/Elements/AT-Datasets/DeepDeform/"
-workspace           = f"/media/{user}/Elements/"
-experiments_dir     = os.path.join(workspace, "experiments_paper")
+# dataset_base_dir    = f"/media/{user}/Elements/AT-Datasets/DeepDeform/"
+# workspace           = f"/media/{user}/Elements/"
+# experiments_dir     = os.path.join(workspace, "experiments_paper")
+experiments_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)),"experiments")
 
 image_width = 640
 image_height = 448
