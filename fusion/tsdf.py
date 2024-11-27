@@ -449,7 +449,7 @@ class TSDFVolume:
 
 		# Marching cubes
 		# Create mask such that marching cubes runs only on that points, otherwise it would create 2 surfaces.
-		verts, faces, norms, vals = measure.marching_cubes_lewiner(tsdf_vol, mask=(weight_vol > 0), level=0)
+		verts, faces, norms, vals = measure.marching_cubes(tsdf_vol, mask=(weight_vol > 0), level=0)
 
 		verts_ind = np.round(verts).astype(int)
 		verts = verts*self._voxel_size+self._vol_origin  # voxel grid coordinates to world coordinates

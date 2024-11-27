@@ -15,7 +15,7 @@ from scipy.io import savemat
 
 import matplotlib.pyplot as plt
 
-sys.path.append("../")  # Making it easier to load modules
+sys.path.append("fusion/")  # Making it easier to load modules
 
 # Modules
 from utils import image_proc
@@ -349,7 +349,7 @@ class DynamicFusion:
 							graph_data = self.dataloader.load_dict(prev_graph_path)
 
 					graph_deformation_data = self.estimate_warp_field_parameters(source_data, target_data, graph_data,graph_deformation_data,
-												show_frame=False)
+												show_frame=True)
 					print(
 						f"Estimated Warpfield Parameters for Frame:{i} Info: {graph_deformation_data['convergence_info']}")
 					savemat(deformation_path,graph_deformation_data) # Save results
@@ -474,7 +474,7 @@ if __name__ == "__main__":
 
 	seq_path = None
 	source_frame = 0
-	skip = 1
+	skip = 3
 	keyframe_interval = 50
 	voxel_size = 0.01
 	if len(sys.argv) <= 1:

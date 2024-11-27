@@ -463,7 +463,8 @@ def update_graph(new_verts, graph_data,min_neighbours=3,plot_update=False):
 	graph_data["graph_edges"] = np.concatenate([graph_data["graph_edges"], nn_nodes], axis=0)
 
 	nn_weights = nn_dists.copy()
-	nn_weights[nn_weights == -1] = np.inf # Updating dists to calculate weights
+	# nn_weights[nn_weights == -1] = np.inf # Updating dists to calculate weights
+	nn_weights[nn_nodes == -1] = np.inf
 	nn_weights = np.exp(-0.5 * (nn_dists / graph_data["node_coverage"]) ** 2)
 	nn_weights /= np.sum(nn_weights, axis=1, keepdims=True)
 	graph_data["graph_edges_weights"] = np.concatenate([graph_data["graph_edges_weights"], nn_weights], axis=0)

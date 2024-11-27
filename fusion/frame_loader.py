@@ -46,7 +46,7 @@ class RGBDVideoLoader:
 				'erosion_num_iterations': 10, # Will reduce outliers points (simliar to erosion in images)
 				'erosion_min_neighbors' : 4, # Will reduce outlier clusters
 				'node_coverage'		   	: 0.05, # Sampling parameter which defines the number of nodes
-				'require_mask'			: True,
+				'require_mask'			: False,
 				}
 
 		# Load all types of data avaible

@@ -85,7 +85,7 @@ class Deformnet_runner():
 		# Run Neural Non Rigid tracking and obtain results
 		with torch.no_grad():
 			model_data = self.model(
-				source_cuda, target_cuda, 
+				source_cuda, target_cuda, graph_nodes_cuda,
 				graph_nodes_cuda, graph_edges_cuda, graph_edges_weights_cuda, graph_clusters_cuda, 
 				pixel_anchors_cuda, pixel_weights_cuda, 
 				num_nodes_cuda, intrinsics_cuda, 
